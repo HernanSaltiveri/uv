@@ -16,12 +16,15 @@ fn init() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
+    ");
+
+    uv_snapshot!(context.filters(), context.init().arg("foo"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/foo` because `pyproject.toml` already exists
     ");
 
     let pyproject = context.read("foo/pyproject.toml");
@@ -39,16 +42,20 @@ fn init() {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
 
     // Run `uv lock` in the new project.
     uv_snapshot!(context.filters(), context.lock().current_dir(context.temp_dir.join("foo")), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Resolved 1 package in [TIME]
@@ -65,14 +72,81 @@ fn init() {
 }
 
 #[test]
+fn init_existing_pyproject_tool_only() -> Result<()> {
+    let context = uv_test::test_context_with_versions!(&[]);
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str("[tool.ruff]\n")?;
+
+    uv_snapshot!(context.filters(), context.init(), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/` because `pyproject.toml` already exists
+
+    hint: To use this directory as a project, declare its name, version, and other metadata in a `[project]` table
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn init_existing_pyproject_poetry() -> Result<()> {
+    let context = uv_test::test_context_with_versions!(&[]);
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {
+        r#"
+        [tool.poetry]
+        name = "example"
+        version = "0.1.0"
+
+        [build-system]
+        requires = ["poetry-core"]
+        build-backend = "poetry.core.masonry.api"
+        "#,
+    })?;
+
+    uv_snapshot!(context.filters(), context.init(), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/` because `pyproject.toml` already exists
+
+    hint: uv reads project metadata from `[project]`. To migrate, convert the metadata in `[tool.poetry]` to that format
+    ");
+
+    Ok(())
+}
+
+/// A build backend can read project metadata from outside `pyproject.toml`.
+#[test]
+fn init_existing_pyproject_build_system() -> Result<()> {
+    let context = uv_test::test_context_with_versions!(&[]);
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {
+        r#"
+        [build-system]
+        requires = ["setuptools"]
+        build-backend = "setuptools.build_meta"
+
+        [tool.ruff]
+        "#,
+    })?;
+
+    uv_snapshot!(context.filters(), context.init(), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/` because `pyproject.toml` already exists
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn init_bare() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--bare"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -111,7 +185,7 @@ fn init_bare() {
     });
 }
 
-/// Run `uv init --app` to create an application project
+/// Run `uv init --app` to create a packaged application project
 #[test]
 fn init_application() -> Result<()> {
     let context = uv_test::test_context!("3.12");
@@ -119,197 +193,13 @@ fn init_application() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let main_py = child.join("main.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            pyproject, @r#"
-        [project]
-        name = "foo"
-        version = "0.1.0"
-        description = "Add your description here"
-        readme = "README.md"
-        requires-python = ">=3.12"
-        dependencies = []
-        "#
-        );
-    });
-
-    let hello = fs_err::read_to_string(main_py)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            hello, @r#"
-        def main():
-            print("Hello from foo!")
-
-
-        if __name__ == "__main__":
-            main()
-        "#
-        );
-    });
-
-    uv_snapshot!(context.filters(), context.run().current_dir(&child).arg("main.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-    Hello from foo!
-
-    ----- stderr -----
-    warning: `VIRTUAL_ENV=[VENV]/` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
-    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
-    Creating virtual environment at: .venv
-    Resolved 1 package in [TIME]
-    Checked in [TIME]
-    ");
-
-    Ok(())
-}
-
-/// When `main.py` already exists, we don't create it again
-#[test]
-fn init_application_hello_exists() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
-
-    let child = context.temp_dir.child("foo");
-    child.create_dir_all()?;
-
-    let pyproject_toml = child.join("pyproject.toml");
-    let main_py = child.child("main.py");
-    main_py.touch()?;
-
-    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
-    ----- stderr -----
-    Initialized project `foo`
-    ");
-
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            pyproject, @r#"
-        [project]
-        name = "foo"
-        version = "0.1.0"
-        description = "Add your description here"
-        readme = "README.md"
-        requires-python = ">=3.12"
-        dependencies = []
-        "#
-        );
-    });
-
-    let hello = fs_err::read_to_string(main_py)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            hello, @""
-        );
-    });
-
-    Ok(())
-}
-
-/// When other Python files already exists, we still create `main.py`
-#[test]
-fn init_application_other_python_exists() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
-
-    let child = context.temp_dir.child("foo");
-    child.create_dir_all()?;
-
-    let pyproject_toml = child.join("pyproject.toml");
-    let main_py = child.join("main.py");
-    let other_py = child.child("foo.py");
-    other_py.touch()?;
-
-    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
-    ----- stderr -----
-    Initialized project `foo`
-    ");
-
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            pyproject, @r#"
-        [project]
-        name = "foo"
-        version = "0.1.0"
-        description = "Add your description here"
-        readme = "README.md"
-        requires-python = ">=3.12"
-        dependencies = []
-        "#
-        );
-    });
-
-    let hello = fs_err::read_to_string(main_py)?;
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            hello, @r#"
-        def main():
-            print("Hello from foo!")
-
-
-        if __name__ == "__main__":
-            main()
-        "#
-        );
-    });
-
-    Ok(())
-}
-
-/// Run `uv init --app --package` to create a packaged application project
-#[test]
-fn init_application_package() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
-
-    let child = context.temp_dir.child("foo");
-    child.create_dir_all()?;
-
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-
-    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
-    ----- stderr -----
-    Initialized project `foo`
-    ");
-
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -333,7 +223,7 @@ fn init_application_package() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -346,8 +236,262 @@ fn init_application_package() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).arg("foo"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
+    ----- stdout -----
+    Hello from foo!
+
+    ----- stderr -----
+    warning: `VIRTUAL_ENV=[VENV]/` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
+    Creating virtual environment at: .venv
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + foo==0.1.0 (from file://[TEMP_DIR]/foo)
+    ");
+
+    Ok(())
+}
+
+/// When `main.py` already exists in an unpackaged application, we don't create it again
+#[test]
+fn init_application_no_package_main_exists() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let child = context.temp_dir.child("foo");
+    child.create_dir_all()?;
+
+    let main_py = child.child("main.py");
+    main_py.touch()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--no-package"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `foo`
+    ");
+
+    let pyproject = context.read("foo/pyproject.toml");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            pyproject, @r#"
+        [project]
+        name = "foo"
+        version = "0.1.0"
+        description = "Add your description here"
+        readme = "README.md"
+        requires-python = ">=3.12"
+        dependencies = []
+        "#
+        );
+    });
+
+    let hello = context.read("foo/main.py");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            hello, @""
+        );
+    });
+
+    Ok(())
+}
+
+/// When other Python files already exist in an unpackaged application, we still create `main.py`
+#[test]
+fn init_application_no_package_other_python_exists() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let child = context.temp_dir.child("foo");
+    child.create_dir_all()?;
+
+    let other_py = child.child("foo.py");
+    other_py.touch()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--no-package"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `foo`
+    ");
+
+    let pyproject = context.read("foo/pyproject.toml");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            pyproject, @r#"
+        [project]
+        name = "foo"
+        version = "0.1.0"
+        description = "Add your description here"
+        readme = "README.md"
+        requires-python = ">=3.12"
+        dependencies = []
+        "#
+        );
+    });
+
+    let hello = context.read("foo/main.py");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            hello, @r#"
+        def main():
+            print("Hello from foo!")
+
+
+        if __name__ == "__main__":
+            main()
+        "#
+        );
+    });
+
+    Ok(())
+}
+
+/// `--no-package` takes precedence over `UV_INIT_BUILD_BACKEND`, but not over `--build-backend`.
+///
+/// See: <https://github.com/astral-sh/uv/issues/17335>
+#[test]
+fn init_application_no_package_build_backend_env() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let child = context.temp_dir.child("foo");
+    child.create_dir_all()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--no-package").arg("--build-backend").arg("setuptools"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: the argument '--no-package' cannot be used with '--build-backend <BUILD_BACKEND>'
+
+    Usage: uv init --cache-dir [CACHE_DIR] --app --no-package [PATH]
+
+    For more information, try '--help'.
+    ");
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--no-package").env(EnvVars::UV_INIT_BUILD_BACKEND, "setuptools"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `foo`
+    ");
+
+    let pyproject = context.read("foo/pyproject.toml");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            pyproject, @r#"
+        [project]
+        name = "foo"
+        version = "0.1.0"
+        description = "Add your description here"
+        readme = "README.md"
+        requires-python = ">=3.12"
+        dependencies = []
+        "#
+        );
+    });
+
+    child.child("main.py").assert(predicate::path::is_file());
+    child.child("src").assert(predicate::path::missing());
+
+    Ok(())
+}
+
+/// `--script` takes precedence over `UV_INIT_BUILD_BACKEND`.
+#[test]
+fn init_script_build_backend_env() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let child = context.temp_dir.child("foo");
+    child.create_dir_all()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("main.py").env(EnvVars::UV_INIT_BUILD_BACKEND, "setuptools"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized script at `main.py`
+    ");
+
+    child
+        .child("pyproject.toml")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+/// Environment settings are validated even when the command does not use a build backend.
+#[test]
+fn init_build_backend_env_invalid() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.init().arg("--no-package").env(EnvVars::UV_INIT_BUILD_BACKEND, "unknown"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to parse environment variable `UV_INIT_BUILD_BACKEND` with invalid value `unknown`: invalid variant: unknown
+    ");
+
+    uv_snapshot!(context.filters(), context.sync().env(EnvVars::UV_INIT_BUILD_BACKEND, "unknown"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to parse environment variable `UV_INIT_BUILD_BACKEND` with invalid value `unknown`: invalid variant: unknown
+    ");
+}
+
+/// Run `uv init --app --package` to create a packaged application project
+#[test]
+fn init_application_package() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let child = context.temp_dir.child("foo");
+    child.create_dir_all()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `foo`
+    ");
+
+    let pyproject = context.read("foo/pyproject.toml");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            pyproject, @r#"
+        [project]
+        name = "foo"
+        version = "0.1.0"
+        description = "Add your description here"
+        readme = "README.md"
+        requires-python = ">=3.12"
+        dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
+        "#
+        );
+    });
+
+    let init = context.read("foo/src/foo/__init__.py");
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(
+            init, @r#"
+        def main() -> None:
+            print("Hello from foo!")
+        "#
+        );
+    });
+
+    uv_snapshot!(context.filters(), context.run().current_dir(&child).arg("foo"), @"
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -372,20 +516,13 @@ fn init_library() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let py_typed = child.join("src").join("foo").join("py.typed");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -406,7 +543,7 @@ fn init_library() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -418,7 +555,7 @@ fn init_library() -> Result<()> {
         );
     });
 
-    let py_typed = fs_err::read_to_string(py_typed)?;
+    let py_typed = context.read("foo/src/foo/py.typed");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -428,8 +565,7 @@ fn init_library() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).arg("python").arg("-c").arg("import foo; print(foo.hello())"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -455,15 +591,12 @@ fn init_package() -> Result<()> {
     child.create_dir_all()?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--package"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -495,10 +628,7 @@ fn init_bare_lib() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--bare").arg("--lib"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -547,10 +677,7 @@ fn init_bare_package() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--bare").arg("--package"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -604,10 +731,7 @@ fn init_bare_opt_in() {
         .arg("--description").arg("foo")
         .arg("--pin-python")
         .arg("--vcs").arg("git"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -651,10 +775,7 @@ fn init_bare_env_var() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").env(EnvVars::UV_INIT_BARE, "true"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -700,18 +821,13 @@ fn init_script() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let script = child.join("main.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("main.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `main.py`
     ");
 
-    let script = fs_err::read_to_string(&script)?;
+    let script = context.read("foo/main.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -734,12 +850,9 @@ fn init_script() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).arg("python").arg("main.py"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from main.py!
-
-    ----- stderr -----
     ");
 
     Ok(())
@@ -753,18 +866,13 @@ fn init_script_bare() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let script = child.join("main.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("--bare").arg("main.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `main.py`
     ");
 
-    let script = fs_err::read_to_string(&script)?;
+    let script = context.read("foo/main.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -789,18 +897,13 @@ fn init_script_python_version() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let script = child.join("version.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("version.py").arg("--python").arg("3.11"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `version.py`
     ");
 
-    let script = fs_err::read_to_string(&script)?;
+    let script = context.read("foo/version.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -825,6 +928,67 @@ fn init_script_python_version() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn init_script_python_version_file() -> Result<()> {
+    let context = uv_test::test_context_with_versions!(&["3.12", "3.11"]);
+    let scripts = context.temp_dir.child("scripts");
+    scripts.create_dir_all()?;
+    scripts.child(".python-version").write_str("3.11")?;
+
+    let outside = context.temp_dir.child("outside");
+    outside.create_dir_all()?;
+    outside.child(".python-version").write_str("3.12")?;
+
+    context
+        .init()
+        .current_dir(&outside)
+        .arg("--script")
+        .arg(scripts.join("pinned.py"))
+        .assert()
+        .success();
+    let pinned = context.read("scripts/pinned.py");
+    assert_snapshot!(pinned, @r#"
+    # /// script
+    # requires-python = ">=3.11"
+    # dependencies = []
+    # ///
+
+
+    def main() -> None:
+        print("Hello from pinned.py!")
+
+
+    if __name__ == "__main__":
+        main()
+    "#);
+
+    context
+        .init()
+        .current_dir(&outside)
+        .arg("--script")
+        .arg("--no-pin-python")
+        .arg(scripts.join("unpinned.py"))
+        .assert()
+        .success();
+    let unpinned = context.read("scripts/unpinned.py");
+    assert_snapshot!(unpinned, @r#"
+    # /// script
+    # requires-python = ">=3.12"
+    # dependencies = []
+    # ///
+
+
+    def main() -> None:
+        print("Hello from unpinned.py!")
+
+
+    if __name__ == "__main__":
+        main()
+    "#);
+
+    Ok(())
+}
+
 // Init script should create parent directories if they don't exist
 #[test]
 fn init_script_create_directory() -> Result<()> {
@@ -833,18 +997,13 @@ fn init_script_create_directory() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let script = child.join("test").join("dir.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("test/dir.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `test/dir.py`
     ");
 
-    let script = fs_err::read_to_string(&script)?;
+    let script = context.read("foo/test/dir.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -878,19 +1037,13 @@ fn init_script_file_conflicts() -> Result<()> {
     child.create_dir_all()?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("name_conflict.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `name_conflict.py`
     ");
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("name_conflict.py"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `name_conflict.py` is already a PEP 723 script; use `uv run` to execute it
     ");
@@ -899,15 +1052,12 @@ fn init_script_file_conflicts() -> Result<()> {
     fs_err::write(child.join("existing_script.py"), contents)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--script").arg("existing_script.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `existing_script.py`
     ");
 
-    let existing_script = fs_err::read_to_string(child.join("existing_script.py"))?;
+    let existing_script = context.read("foo/existing_script.py");
 
     assert_snapshot!(
         existing_script, @r#"
@@ -930,19 +1080,19 @@ fn init_script_shebang() -> Result<()> {
 
     let script_path = context.temp_dir.child("script.py");
 
-    let contents = "#! /usr/bin/env python3\nprint(\"Hello, world!\")";
+    let contents = indoc! {r#"
+        #! /usr/bin/env python3
+        print("Hello, world!")
+    "#};
     fs_err::write(&script_path, contents)?;
     uv_snapshot!(context.filters(), context.init().arg("--script").arg("script.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     warning: If you execute script.py directly, it might ignore its inline metadata.
     Consider replacing its shebang with: #!/usr/bin/env -S uv run --script
     Initialized script at `script.py`
     ");
-    let resulting_script = fs_err::read_to_string(&script_path)?;
+    let resulting_script = context.read("script.py");
     assert_snapshot!(resulting_script, @r#"
     #! /usr/bin/env python3
     #
@@ -956,17 +1106,17 @@ fn init_script_shebang() -> Result<()> {
     );
 
     // If the shebang already contains `uv`, the result is the same, but we suppress the warning.
-    let contents = "#!/usr/bin/env -S uv run --script\nprint(\"Hello, world!\")";
+    let contents = indoc! {r#"
+        #!/usr/bin/env -S uv run --script
+        print("Hello, world!")
+    "#};
     fs_err::write(&script_path, contents)?;
     uv_snapshot!(context.filters(), context.init().arg("--script").arg("script.py"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `script.py`
     ");
-    let resulting_script = fs_err::read_to_string(&script_path)?;
+    let resulting_script = context.read("script.py");
     assert_snapshot!(resulting_script, @r#"
     #!/usr/bin/env -S uv run --script
     #
@@ -986,29 +1136,24 @@ fn init_script_shebang() -> Result<()> {
 // for the `requires-python` constraint.
 #[cfg(feature = "test-python-patch")]
 #[test]
-fn init_script_picks_latest_stable_version() -> Result<()> {
-    let managed_versions = &["3.14.0rc2", "3.13", "3.12"];
+fn init_script_picks_latest_stable_version() {
+    let managed_versions = &["3.16.0a1", "3.15", "3.14"];
     // If we do not mark these versions as managed, they would have `PythonSource::SearchPath(First)`, which
     // would mean that pre-releases would be preferred without opt-in (see `PythonSource::allows_prereleases`).
     let context = uv_test::test_context_with_versions!(managed_versions)
         .with_versions_as_managed(managed_versions);
 
-    let script_path = context.temp_dir.join("main.py");
-
     uv_snapshot!(context.filters(), context.init().arg("--script").arg("main.py"), @r#"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized script at `main.py`
     "#);
 
-    let resulting_script = fs_err::read_to_string(&script_path)?;
+    let resulting_script = context.read("main.py");
     assert_snapshot!(
         resulting_script, @r#"
         # /// script
-        # requires-python = ">=3.13"
+        # requires-python = ">=3.15"
         # dependencies = []
         # ///
 
@@ -1021,8 +1166,6 @@ fn init_script_picks_latest_stable_version() -> Result<()> {
             main()
         "#
     );
-
-    Ok(())
 }
 
 /// Run `uv init --lib` with an existing py.typed file
@@ -1040,15 +1183,12 @@ fn init_py_typed_exists() -> Result<()> {
     fs_err::write(&py_typed, "partial")?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let py_typed = fs_err::read_to_string(py_typed)?;
+    let py_typed = context.read("foo/src/foo/py.typed");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -1068,10 +1208,7 @@ fn init_library_no_package() -> Result<()> {
     child.create_dir_all()?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib").arg("--no-package"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: the argument '--lib' cannot be used with '--no-package'
 
@@ -1091,10 +1228,7 @@ fn init_cache() -> Result<()> {
     fs_err::remove_dir_all(&context.cache_dir)?;
 
     uv_snapshot!(context.filters(), context.init().arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -1107,16 +1241,16 @@ fn init_no_readme() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--no-readme"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
     let pyproject = context.read("foo/pyproject.toml");
-    let _ = fs_err::read_to_string(context.temp_dir.join("foo/README.md")).unwrap_err();
+    context
+        .temp_dir
+        .child("foo/README.md")
+        .assert(predicate::path::missing());
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1129,6 +1263,13 @@ fn init_no_readme() {
         description = "Add your description here"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -1139,16 +1280,16 @@ fn init_no_pin_python() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--no-pin-python"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
     let pyproject = context.read("foo/pyproject.toml");
-    let _ = fs_err::read_to_string(context.temp_dir.join("foo/.python-version")).unwrap_err();
+    context
+        .temp_dir
+        .child("foo/.python-version")
+        .assert(predicate::path::missing());
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1162,6 +1303,13 @@ fn init_no_pin_python() {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -1175,17 +1323,14 @@ fn init_library_current_dir() -> Result<()> {
     fs_err::create_dir(&dir)?;
 
     uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&dir), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(dir.join("pyproject.toml"))?;
-    let init_py = fs_err::read_to_string(dir.join("src/foo/__init__.py"))?;
-    let _ = fs_err::read_to_string(dir.join("README.md")).unwrap();
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
+    let _ = context.read("foo/README.md");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1220,10 +1365,7 @@ fn init_library_current_dir() -> Result<()> {
 
     // Run `uv lock` in the new project.
     uv_snapshot!(context.filters(), context.lock().current_dir(&dir), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Resolved 1 package in [TIME]
@@ -1240,16 +1382,13 @@ fn init_application_current_dir() -> Result<()> {
     fs_err::create_dir(&dir)?;
 
     uv_snapshot!(context.filters(), context.init().arg("--app").current_dir(&dir), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(dir.join("pyproject.toml"))?;
-    let main_py = fs_err::read_to_string(dir.join("main.py"))?;
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1263,6 +1402,13 @@ fn init_application_current_dir() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -1271,23 +1417,16 @@ fn init_application_current_dir() -> Result<()> {
         filters => context.filters(),
     }, {
         assert_snapshot!(
-            main_py, @r#"
-        def main():
+            init_py, @r#"
+        def main() -> None:
             print("Hello from foo!")
-
-
-        if __name__ == "__main__":
-            main()
         "#
         );
     });
 
     // Run `uv lock` in the new project.
     uv_snapshot!(context.filters(), context.lock().current_dir(&dir), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Resolved 1 package in [TIME]
@@ -1304,17 +1443,14 @@ fn init_dot_args() -> Result<()> {
     fs_err::create_dir(&dir)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&dir).arg(".").arg("--lib"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject = fs_err::read_to_string(dir.join("pyproject.toml"))?;
-    let init_py = fs_err::read_to_string(dir.join("src/foo/__init__.py"))?;
-    let _ = fs_err::read_to_string(dir.join("README.md")).unwrap();
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
+    let _ = context.read("foo/README.md");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1349,10 +1485,7 @@ fn init_dot_args() -> Result<()> {
 
     // Run `uv lock` in the new project.
     uv_snapshot!(context.filters(), context.lock().current_dir(&dir), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Resolved 1 package in [TIME]
@@ -1380,19 +1513,16 @@ fn init_workspace() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
-    let init_py = fs_err::read_to_string(child.join("src/foo/__init__.py"))?;
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
 
-    let _ = fs_err::read_to_string(child.join("README.md")).unwrap();
+    let _ = context.read("foo/README.md");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1447,10 +1577,7 @@ fn init_workspace() -> Result<()> {
 
     // Run `uv lock` in the workspace.
     uv_snapshot!(context.filters(), context.lock(), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 5 packages in [TIME]
     ");
@@ -1460,10 +1587,7 @@ fn init_workspace() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `bar` as member of workspace `[TEMP_DIR]/`
     Initialized project `bar`
@@ -1513,10 +1637,7 @@ fn init_workspace() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `baz` as member of workspace `[TEMP_DIR]/`
     Initialized project `baz`
@@ -1562,22 +1683,17 @@ fn init_workspace_relative_sub_package() -> Result<()> {
         "#,
     })?;
 
-    let child = context.temp_dir.join("foo");
-
-    uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&context.temp_dir).arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("--lib").arg("foo"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
-    let init_py = fs_err::read_to_string(child.join("src/foo/__init__.py"))?;
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
 
-    let _ = fs_err::read_to_string(child.join("README.md")).unwrap();
+    let _ = context.read("foo/README.md");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1632,10 +1748,7 @@ fn init_workspace_relative_sub_package() -> Result<()> {
 
     // Run `uv lock` in the workspace.
     uv_snapshot!(context.filters(), context.lock(), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 5 packages in [TIME]
     ");
@@ -1662,19 +1775,16 @@ fn init_workspace_outside() -> Result<()> {
 
     // Run `uv init <path>` outside the workspace.
     uv_snapshot!(context.filters(), context.init().arg("--lib").current_dir(&context.home_dir).arg(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
-    let init_py = fs_err::read_to_string(child.join("src/foo/__init__.py"))?;
+    let pyproject = context.read("foo/pyproject.toml");
+    let init_py = context.read("foo/src/foo/__init__.py");
 
-    let _ = fs_err::read_to_string(child.join("README.md")).unwrap();
+    let _ = context.read("foo/README.md");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1729,10 +1839,7 @@ fn init_workspace_outside() -> Result<()> {
 
     // Run `uv lock` in the workspace.
     uv_snapshot!(context.filters(), context.lock(), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 5 packages in [TIME]
     ");
@@ -1741,22 +1848,18 @@ fn init_workspace_outside() -> Result<()> {
 }
 
 #[test]
-fn init_normalized_names() -> Result<()> {
+fn init_normalized_names() {
     let context = uv_test::test_context!("3.12");
 
     // `foo-bar` module is normalized to `foo-bar`.
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg("foo-bar").arg("--lib"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("foo-bar").arg("--lib"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo-bar` at `[TEMP_DIR]/foo-bar`
     ");
 
-    let child = context.temp_dir.child("foo-bar");
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
-    let _ = fs_err::read_to_string(child.join("src/foo_bar/__init__.py"))?;
+    let pyproject = context.read("foo-bar/pyproject.toml");
+    let _ = context.read("foo-bar/src/foo_bar/__init__.py");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1779,17 +1882,14 @@ fn init_normalized_names() -> Result<()> {
     });
 
     // `bar_baz` module is normalized to `bar-baz`.
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg("bar_baz").arg("--app"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("bar_baz").arg("--app"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `bar-baz` at `[TEMP_DIR]/bar_baz`
     ");
 
-    let child = context.temp_dir.child("bar_baz");
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("bar_baz/pyproject.toml");
+    let _ = context.read("bar_baz/src/bar_baz/__init__.py");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1803,22 +1903,25 @@ fn init_normalized_names() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        bar-baz = "bar_baz:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
 
     // "baz bop" is normalized to "baz-bop".
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg("baz bop"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("baz bop"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `baz-bop` at `[TEMP_DIR]/baz bop`
     ");
 
-    let child = context.temp_dir.child("baz bop");
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("baz bop/pyproject.toml");
 
     insta::with_settings!({
         filters => context.filters(),
@@ -1832,11 +1935,16 @@ fn init_normalized_names() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        baz-bop = "baz_bop:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
-
-    Ok(())
 }
 
 #[test]
@@ -1857,10 +1965,7 @@ fn init_isolated() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--isolated"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     warning: The `--isolated` flag is deprecated and has no effect. Instead, use `--no-config` to prevent uv from discovering configuration files or `--no-workspace` to prevent uv from adding the initialized project to the containing workspace.
     Adding `foo` as member of workspace `[TEMP_DIR]/`
@@ -1909,10 +2014,7 @@ fn init_no_workspace() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--no-workspace"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
@@ -1943,10 +2045,7 @@ fn init_no_workspace() -> Result<()> {
     fs_err::create_dir(&child)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--no-workspace"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `bar`
     ");
@@ -1969,11 +2068,8 @@ fn init_no_workspace() -> Result<()> {
 fn init_no_workspace_warning() {
     let context = uv_test::test_context!("3.12");
 
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg("--no-workspace").arg("--name").arg("project"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("--no-workspace").arg("--name").arg("project"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `project`
     ");
@@ -1992,6 +2088,13 @@ fn init_no_workspace_warning() {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        project = "project:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -2013,11 +2116,8 @@ fn init_project_inside_project() -> Result<()> {
 
     // Create a child from the workspace root.
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
@@ -2025,16 +2125,13 @@ fn init_project_inside_project() -> Result<()> {
 
     // Create a grandchild from the child directory.
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("bar"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `bar` as member of workspace `[TEMP_DIR]/`
     Initialized project `bar` at `[TEMP_DIR]/foo/bar`
     ");
 
-    let workspace = fs_err::read_to_string(pyproject_toml)?;
+    let workspace = context.read("pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2054,7 +2151,7 @@ fn init_project_inside_project() -> Result<()> {
         );
     });
 
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2067,6 +2164,13 @@ fn init_project_inside_project() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -2093,11 +2197,8 @@ fn init_explicit_workspace() -> Result<()> {
     })?;
 
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
@@ -2133,18 +2234,13 @@ fn init_virtual_project() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--virtual"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2162,16 +2258,13 @@ fn init_virtual_project() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("bar"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `bar` as member of workspace `[TEMP_DIR]/foo`
     Initialized project `bar` at `[TEMP_DIR]/foo/bar`
     ");
 
-    let pyproject = fs_err::read_to_string(pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2213,17 +2306,20 @@ fn init_virtual_workspace() -> Result<()> {
         ",
     })?;
 
-    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("bar"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
+    uv_snapshot!(context.filters(), context.init().current_dir(&child), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/foo` because `pyproject.toml` already exists
+    ");
 
+    uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("bar"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `bar` as member of workspace `[TEMP_DIR]/foo`
     Initialized project `bar` at `[TEMP_DIR]/foo/bar`
     ");
 
-    let pyproject = fs_err::read_to_string(pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2253,11 +2349,8 @@ fn init_nested_virtual_workspace() -> Result<()> {
         ",
     })?;
 
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg("--virtual").arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("--virtual").arg("foo"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
@@ -2317,10 +2410,7 @@ fn init_matches_members() -> Result<()> {
     fs_err::create_dir_all(packages.join("foo"))?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(context.temp_dir.join("packages")).arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Project `foo` is already a member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/packages/foo`
@@ -2359,10 +2449,7 @@ fn init_matches_exclude() -> Result<()> {
     fs_err::create_dir_all(packages)?;
 
     uv_snapshot!(context.filters(), context.init().current_dir(context.temp_dir.join("packages")).arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Project `foo` is excluded by workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/packages/foo`
@@ -2403,17 +2490,14 @@ fn init_requires_python_workspace() -> Result<()> {
     })?;
 
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2426,11 +2510,18 @@ fn init_requires_python_workspace() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.10"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
 
-    let python_version = fs_err::read_to_string(child.join(".python-version"))?;
+    let python_version = context.read("foo/.python-version");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2461,17 +2552,14 @@ fn init_requires_python_version() -> Result<()> {
     })?;
 
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child).arg("--python").arg("3.9"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child).arg("--python").arg("3.9"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2484,11 +2572,18 @@ fn init_requires_python_version() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.9"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
 
-    let python_version = fs_err::read_to_string(child.join(".python-version"))?;
+    let python_version = context.read("foo/.python-version");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2520,17 +2615,14 @@ fn init_requires_python_specifiers() -> Result<()> {
     })?;
 
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child).arg("--python").arg("==3.9.*"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child).arg("--python").arg("==3.9.*"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Adding `foo` as member of workspace `[TEMP_DIR]/`
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2543,11 +2635,18 @@ fn init_requires_python_specifiers() -> Result<()> {
         readme = "README.md"
         requires-python = "==3.9.*"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
 
-    let python_version = fs_err::read_to_string(child.join(".python-version"))?;
+    let python_version = context.read("foo/.python-version");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2567,16 +2666,13 @@ fn init_requires_python_version_file() -> Result<()> {
     context.temp_dir.child(".python-version").write_str("3.9")?;
 
     let child = context.temp_dir.join("foo");
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(&child), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(&child), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2589,6 +2685,13 @@ fn init_requires_python_version_file() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.9"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -2606,26 +2709,20 @@ fn init_existing_environment() -> Result<()> {
 
     // Create a new virtual environment in the directory
     uv_snapshot!(context.filters(), context.venv().current_dir(&child).arg("--python").arg("3.12"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Creating virtual environment at: .venv
     Activate with: source .venv/[BIN]/activate
     ");
 
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(child.as_os_str()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(child.as_os_str()), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2638,6 +2735,13 @@ fn init_existing_environment() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -2647,15 +2751,12 @@ fn init_existing_environment() -> Result<()> {
 
 /// Run `uv init`, it should ignore the Python version from a parent `.venv`
 #[test]
-fn init_existing_environment_parent() -> Result<()> {
+fn init_existing_environment_parent() {
     let context = uv_test::test_context_with_versions!(&["3.9", "3.12"]);
 
     // Create a new virtual environment in the parent directory
-    uv_snapshot!(context.filters(), context.venv().current_dir(&context.temp_dir).arg("--python").arg("3.12"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.venv().arg("--python").arg("3.12"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Creating virtual environment at: .venv
@@ -2664,16 +2765,13 @@ fn init_existing_environment_parent() -> Result<()> {
 
     let child = context.temp_dir.child("foo");
 
-    uv_snapshot!(context.filters(), context.init().current_dir(&context.temp_dir).arg(child.as_os_str()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg(child.as_os_str()), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let pyproject_toml = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject_toml = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2686,11 +2784,16 @@ fn init_existing_environment_parent() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.9"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
-
-    Ok(())
 }
 
 /// Run `uv init` from within an unmanaged project.
@@ -2706,11 +2809,14 @@ fn init_unmanaged() -> Result<()> {
         ",
     })?;
 
-    uv_snapshot!(context.filters(), context.init().arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
+    uv_snapshot!(context.filters(), context.init(), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Cannot initialize a project in `[TEMP_DIR]/` because `pyproject.toml` already exists
+    ");
 
+    uv_snapshot!(context.filters(), context.init().arg("foo"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -2731,14 +2837,34 @@ fn init_unmanaged() -> Result<()> {
 }
 
 #[test]
+fn init_python_current_directory() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let directory = context.temp_dir.child("Python");
+    directory.create_dir_all()?;
+
+    uv_snapshot!(context.filters(), context.init().current_dir(&directory), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: The directory name (`Python`) cannot be used as project name, please provide a package name with `--name`.
+    ");
+
+    // An explicit name is allowed, even if it is `python`.
+    uv_snapshot!(context.filters(), context.init().current_dir(&directory).arg("--name").arg("python").arg("--bare"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `python`
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn init_hidden() {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.init().arg(".foo"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The target directory (`.foo`) is not a valid package name. Please provide a package name with `--name`.
     ");
@@ -2755,10 +2881,7 @@ fn init_non_ascii_directory() -> Result<()> {
     command.current_dir(directory.path());
 
     uv_snapshot!(context.filters(), command, @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The current directory (`püthon`) is not a valid package name. Please provide a package name with `--name`.
     ");
@@ -2776,20 +2899,14 @@ fn init_failure() -> Result<()> {
     pyproject_toml.touch()?;
 
     uv_snapshot!(context.filters(), context.init().arg("foo"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Failed to discover parent workspace; use `uv init --no-workspace` to ignore
-      Caused by: No `project` table found in: [TEMP_DIR]/pyproject.toml
+      cause: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
 
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--no-workspace"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -2807,6 +2924,13 @@ fn init_failure() -> Result<()> {
         readme = "README.md"
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -2818,10 +2942,7 @@ fn init_failure() -> Result<()> {
 fn init_failure_with_invalid_option_named_backend() {
     let context = uv_test::test_context!("3.12");
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--backend"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: unexpected argument '--backend' found
 
@@ -2832,10 +2953,7 @@ fn init_failure_with_invalid_option_named_backend() {
     For more information, try '--help'.
     ");
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--backend").arg("maturin"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: unexpected argument '--backend' found
 
@@ -2848,21 +2966,18 @@ fn init_failure_with_invalid_option_named_backend() {
 }
 #[test]
 #[cfg(feature = "test-git")]
-fn init_git() -> Result<()> {
+fn init_git() {
     let context = uv_test::test_context!("3.12");
 
     let child = context.temp_dir.child("foo");
 
     uv_snapshot!(context.filters(), context.init().arg(child.as_ref()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
 
-    let gitignore = fs_err::read_to_string(child.join(".gitignore"))?;
+    let gitignore = context.read("foo/.gitignore");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -2883,8 +2998,6 @@ fn init_git() -> Result<()> {
     });
 
     child.child(".git").assert(predicate::path::is_dir());
-
-    Ok(())
 }
 
 #[test]
@@ -2894,10 +3007,7 @@ fn init_vcs_none() {
     let child = context.temp_dir.child("foo");
 
     uv_snapshot!(context.filters(), context.init().arg(child.as_ref()).arg("--vcs").arg("none"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -2921,10 +3031,7 @@ fn init_inside_git_repo() {
     let child = context.temp_dir.child("foo");
 
     uv_snapshot!(context.filters(), context.init().arg(child.as_ref()).arg("--vcs").arg("git"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -2933,10 +3040,7 @@ fn init_inside_git_repo() {
 
     let child = context.temp_dir.child("bar");
     uv_snapshot!(context.filters(), context.init().arg(child.as_ref()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `bar` at `[TEMP_DIR]/bar`
     ");
@@ -2952,10 +3056,7 @@ fn init_git_not_installed() {
 
     // Without explicit `--vcs git`, `uv init` succeeds without initializing a Git repository.
     uv_snapshot!(context.filters(), context.init().env(EnvVars::PATH, &*child).arg(child.as_ref()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -2964,10 +3065,7 @@ fn init_git_not_installed() {
     let child = context.temp_dir.child("bar");
     // Set `PATH` to child to make `git` command cannot be found.
     uv_snapshot!(context.filters(), context.init().env(EnvVars::PATH, &*child).arg(child.as_ref()).arg("--vcs").arg("git"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Attempted to initialize a Git repository, but `git` was not found in PATH
     ");
@@ -3013,8 +3111,18 @@ fn init_with_author() {
         version = "0.1.0"
         description = "Add your description here"
         readme = "README.md"
+        authors = [
+            { name = "Alice", email = "alice@example.com" }
+        ]
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        foo = "foo:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -3043,6 +3151,13 @@ fn init_with_author() {
         ]
         requires-python = ">=3.12"
         dependencies = []
+
+        [project.scripts]
+        bar = "bar:main"
+
+        [build-system]
+        requires = ["uv_build>=[CURRENT_VERSION],<[NEXT_BREAKING]"]
+        build-backend = "uv_build"
         "#
         );
     });
@@ -3112,19 +3227,13 @@ fn init_application_package_flit() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package").arg("--build-backend").arg("flit"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3148,7 +3257,7 @@ fn init_application_package_flit() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3161,8 +3270,7 @@ fn init_application_package_flit() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).env_remove(EnvVars::VIRTUAL_ENV).arg("foo"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -3186,20 +3294,13 @@ fn init_library_flit() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let py_typed = child.join("src").join("foo").join("py.typed");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib").arg("--build-backend").arg("flit"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3220,7 +3321,7 @@ fn init_library_flit() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3232,7 +3333,7 @@ fn init_library_flit() -> Result<()> {
         );
     });
 
-    let py_typed = fs_err::read_to_string(py_typed)?;
+    let py_typed = context.read("foo/src/foo/py.typed");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3242,8 +3343,7 @@ fn init_library_flit() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).env_remove(EnvVars::VIRTUAL_ENV).arg("python").arg("-c").arg("import foo; print(foo.hello())"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -3264,11 +3364,8 @@ fn init_library_flit() -> Result<()> {
 fn init_backend_implies_package() {
     let context = uv_test::test_context!("3.12");
 
-    uv_snapshot!(context.filters(), context.init().arg("project").arg("--build-backend").arg("flit"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("project").arg("--build-backend").arg("flit").env(EnvVars::UV_INIT_BUILD_BACKEND, "setuptools"), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `project` at `[TEMP_DIR]/project`
     ");
@@ -3296,6 +3393,13 @@ fn init_backend_implies_package() {
         "#
         );
     });
+
+    uv_snapshot!(context.filters(), context.init().arg("from-env/project").env(EnvVars::UV_INIT_BUILD_BACKEND, "flit-core"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Initialized project `project` at `[TEMP_DIR]/from-env/project`
+    ");
+    assert_eq!(context.read("from-env/project/pyproject.toml"), pyproject);
 }
 
 /// Run `uv init --build-backend poetry` to create a project with poetry-core build backend
@@ -3306,20 +3410,13 @@ fn init_library_poetry() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let py_typed = child.join("src").join("foo").join("py.typed");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib").arg("--build-backend").arg("poetry"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3340,7 +3437,7 @@ fn init_library_poetry() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3352,7 +3449,7 @@ fn init_library_poetry() -> Result<()> {
         );
     });
 
-    let py_typed = fs_err::read_to_string(py_typed)?;
+    let py_typed = context.read("foo/src/foo/py.typed");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3362,8 +3459,7 @@ fn init_library_poetry() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().current_dir(&child).env_remove(EnvVars::VIRTUAL_ENV).arg("python").arg("-c").arg("import foo; print(foo.hello())"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -3388,22 +3484,13 @@ fn init_app_build_backend_maturin() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let pyi_file = child.join("src").join("foo").join("_core.pyi");
-    let lib_core = child.join("src").join("lib.rs");
-    let build_file = child.join("Cargo.toml");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package").arg("--build-backend").arg("maturin"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3435,7 +3522,7 @@ fn init_app_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3450,7 +3537,7 @@ fn init_app_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let pyi_contents = fs_err::read_to_string(pyi_file)?;
+    let pyi_contents = context.read("foo/src/foo/_core.pyi");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3459,7 +3546,7 @@ fn init_app_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let lib_core_contents = fs_err::read_to_string(lib_core)?;
+    let lib_core_contents = context.read("foo/src/lib.rs");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3483,7 +3570,7 @@ fn init_app_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let build_file_contents = fs_err::read_to_string(build_file)?;
+    let build_file_contents = context.read("foo/Cargo.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3518,22 +3605,13 @@ fn init_app_build_backend_scikit() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let pyi_file = child.join("src").join("foo").join("_core.pyi");
-    let lib_core = child.join("src").join("main.cpp");
-    let build_file = child.join("CMakeLists.txt");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package").arg("--build-backend").arg("scikit"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3564,7 +3642,7 @@ fn init_app_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3579,7 +3657,7 @@ fn init_app_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let pyi_contents = fs_err::read_to_string(pyi_file)?;
+    let pyi_contents = context.read("foo/src/foo/_core.pyi");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3588,7 +3666,7 @@ fn init_app_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let lib_core_contents = fs_err::read_to_string(lib_core)?;
+    let lib_core_contents = context.read("foo/src/main.cpp");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3611,7 +3689,7 @@ fn init_app_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let build_file_contents = fs_err::read_to_string(build_file)?;
+    let build_file_contents = context.read("foo/CMakeLists.txt");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3642,22 +3720,13 @@ fn init_lib_build_backend_maturin() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let pyi_file = child.join("src").join("foo").join("_core.pyi");
-    let lib_core = child.join("src").join("lib.rs");
-    let build_file = child.join("Cargo.toml");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib").arg("--build-backend").arg("maturin"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3686,7 +3755,7 @@ fn init_lib_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3701,7 +3770,7 @@ fn init_lib_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let pyi_contents = fs_err::read_to_string(pyi_file)?;
+    let pyi_contents = context.read("foo/src/foo/_core.pyi");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3710,7 +3779,7 @@ fn init_lib_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let lib_core_contents = fs_err::read_to_string(lib_core)?;
+    let lib_core_contents = context.read("foo/src/lib.rs");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3734,7 +3803,7 @@ fn init_lib_build_backend_maturin() -> Result<()> {
         );
     });
 
-    let build_file_contents = fs_err::read_to_string(build_file)?;
+    let build_file_contents = context.read("foo/Cargo.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3769,22 +3838,13 @@ fn init_lib_build_backend_scikit() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-    let pyi_file = child.join("src").join("foo").join("_core.pyi");
-    let lib_core = child.join("src").join("main.cpp");
-    let build_file = child.join("CMakeLists.txt");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--lib").arg("--build-backend").arg("scikit"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3812,7 +3872,7 @@ fn init_lib_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3827,7 +3887,7 @@ fn init_lib_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let pyi_contents = fs_err::read_to_string(pyi_file)?;
+    let pyi_contents = context.read("foo/src/foo/_core.pyi");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3836,7 +3896,7 @@ fn init_lib_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let lib_core_contents = fs_err::read_to_string(lib_core)?;
+    let lib_core_contents = context.read("foo/src/main.cpp");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3859,7 +3919,7 @@ fn init_lib_build_backend_scikit() -> Result<()> {
         );
     });
 
-    let build_file_contents = fs_err::read_to_string(build_file)?;
+    let build_file_contents = context.read("foo/CMakeLists.txt");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3889,19 +3949,13 @@ fn init_application_package_hatchling() -> Result<()> {
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
-    let pyproject_toml = child.join("pyproject.toml");
-    let init_py = child.join("src").join("foo").join("__init__.py");
-
     uv_snapshot!(context.filters(), context.init().current_dir(&child).arg("--app").arg("--package").arg("--build-backend").arg("hatchling"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo`
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("foo/pyproject.toml");
     assert_snapshot!(
         pyproject, @r#"
     [project]
@@ -3921,7 +3975,7 @@ fn init_application_package_hatchling() -> Result<()> {
     "#
     );
 
-    let init = fs_err::read_to_string(init_py)?;
+    let init = context.read("foo/src/foo/__init__.py");
     insta::with_settings!({
         filters => context.filters(),
     }, {
@@ -3934,8 +3988,7 @@ fn init_application_package_hatchling() -> Result<()> {
     });
 
     uv_snapshot!(context.filters(), context.run().arg("foo").current_dir(&child).env_remove(EnvVars::VIRTUAL_ENV), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Hello from foo!
 
@@ -3969,7 +4022,7 @@ fn init_with_description() -> Result<()> {
         .success();
 
     // Read the generated pyproject.toml
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("foo/pyproject.toml");
 
     // Verify the description in pyproject.toml
     insta::with_settings!({
@@ -4011,7 +4064,7 @@ fn init_without_description() -> Result<()> {
         .success();
 
     // Read the generated pyproject.toml
-    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
+    let pyproject = context.read("bar/pyproject.toml");
 
     // Verify the default description in pyproject.toml
     insta::with_settings!({
@@ -4042,10 +4095,7 @@ fn init_without_description() -> Result<()> {
 fn init_python_variant() {
     let context = uv_test::test_context!("3.13");
     uv_snapshot!(context.filters(), context.init().arg("foo").arg("--python").arg("3.13t"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/foo`
     ");
@@ -4103,10 +4153,7 @@ fn git_states() {
         .arg("broken-git")
         .arg("--vcs")
         .arg("git"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Failed to initialize Git repository at `[TEMP_DIR]/broken-git`
     stdout:
@@ -4115,89 +4162,29 @@ fn git_states() {
     assert!(!context.temp_dir.child("broken-git/.git").is_dir());
 }
 
-/// Using `uv init` with `--project` isn't allowed
+/// Using `uv init` with `--project` isn't allowed.
 #[test]
-fn init_project_flag_is_not_allowed_under_preview() -> Result<()> {
+fn init_project_flag_is_not_allowed() -> Result<()> {
     let context = uv_test::test_context!("3.12");
 
     let child = context.temp_dir.child("foo");
     child.create_dir_all()?;
 
     // Positional `path` provided
-    uv_snapshot!(context.filters(), context.init().arg("--preview-features").arg("init-project-flag").arg("--project").arg("foo").arg("bar"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("--project").arg("foo").arg("bar"), @"
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The `--project` option cannot be used in `uv init`. Use `--directory` instead.
     ");
 
     // No positional `path` provided
-    uv_snapshot!(context.filters(), context.init().arg("--preview-features").arg("init-project-flag").arg("--project").arg("foo"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    uv_snapshot!(context.filters(), context.init().arg("--project").arg("foo"), @"
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The `--project` option cannot be used in `uv init`. Use `--directory` or a positional path instead.
     ");
 
     Ok(())
-}
-
-#[test]
-fn init_project_flag_is_ignored_with_explicit_path() {
-    let context = uv_test::test_context!("3.12");
-
-    // with explicit path
-    uv_snapshot!(context.filters(), context.init().arg("--project").arg("bar").arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
-    ----- stderr -----
-    warning: Use of the `--project` option in `uv init` is deprecated and will be removed in a future release. Since a positional path was provided, the `--project` option has no effect. Consider using `--directory` instead.
-    Initialized project `foo` at `[TEMP_DIR]/foo`
-    ");
-
-    let pyproject = context.read("foo/pyproject.toml");
-    insta::with_settings!({
-        filters => context.filters(),
-    }, {
-        assert_snapshot!(
-            pyproject, @r#"
-        [project]
-        name = "foo"
-        version = "0.1.0"
-        description = "Add your description here"
-        readme = "README.md"
-        requires-python = ">=3.12"
-        dependencies = []
-        "#
-        );
-    });
-}
-
-#[test]
-fn init_project_flag_is_warned_without_path() {
-    let context = uv_test::test_context!("3.12");
-
-    // with explicit path
-    uv_snapshot!(context.filters(), context.init().arg("--project").arg("bar"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
-    ----- stderr -----
-    warning: Use of the `--project` option in `uv init` is deprecated and will be removed in a future release. Consider using `uv init <PATH>` instead.
-    Initialized project `bar`
-    ");
-
-    context
-        .temp_dir
-        .child("bar/pyproject.toml")
-        .assert(predicate::path::is_file());
 }
 
 /// The `--directory` flag is used as the base for path
@@ -4209,10 +4196,7 @@ fn init_working_directory_change() -> Result<()> {
     child.create_dir_all()?;
 
     uv_snapshot!(context.filters(), context.init().arg("--directory").arg("bar").arg("foo"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Initialized project `foo` at `[TEMP_DIR]/bar/foo`
     ");

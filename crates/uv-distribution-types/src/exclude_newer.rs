@@ -4,6 +4,7 @@ use std::str::FromStr;
 use jiff::{Span, Timestamp, ToSpan, Unit, tz::TimeZone};
 use serde::Deserialize;
 use serde::de::value::MapAccessDeserializer;
+use uv_macros::DeserializeUntagged;
 
 #[derive(Debug, Copy, Clone)]
 pub struct ExcludeNewerSpan(Span);
@@ -107,12 +108,12 @@ impl ExcludeNewerValue {
     }
 }
 
-/// Return the current time, respecting the `UV_TEST_CURRENT_TIMESTAMP` override.
+/// Return the current time, respecting the `UV_INTERNAL__TEST_CURRENT_TIMESTAMP` override.
 fn current_time() -> jiff::Zoned {
-    if let Ok(test_time) = std::env::var("UV_TEST_CURRENT_TIMESTAMP") {
+    if let Ok(test_time) = std::env::var("UV_INTERNAL__TEST_CURRENT_TIMESTAMP") {
         test_time
             .parse::<Timestamp>()
-            .expect("UV_TEST_CURRENT_TIMESTAMP must be a valid RFC 3339 timestamp")
+            .expect("UV_INTERNAL__TEST_CURRENT_TIMESTAMP must be a valid RFC 3339 timestamp")
             .to_zoned(TimeZone::UTC)
     } else {
         Timestamp::now().to_zoned(TimeZone::UTC)
@@ -133,24 +134,21 @@ impl<'de> serde::Deserialize<'de> for ExcludeNewerValue {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(serde::Deserialize)]
-        struct TableForm {
-            timestamp: Timestamp,
-            span: Option<ExcludeNewerSpan>,
-        }
-
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
+        #[derive(DeserializeUntagged)]
+        enum Cutoff {
+            #[untagged(string)]
             String(String),
-            Table(Box<TableForm>),
+            Table {
+                timestamp: Timestamp,
+                span: Option<ExcludeNewerSpan>,
+            },
         }
 
-        match Helper::deserialize(deserializer)? {
-            Helper::String(s) => Self::from_str(&s).map_err(serde::de::Error::custom),
-            Helper::Table(table) => Ok(match table.span {
+        match Cutoff::deserialize(deserializer)? {
+            Cutoff::String(value) => Self::from_str(&value).map_err(serde::de::Error::custom),
+            Cutoff::Table { timestamp, span } => Ok(match span {
                 Some(span) => Self::relative(span),
-                None => Self::absolute(table.timestamp),
+                None => Self::absolute(timestamp),
             }),
         }
     }
@@ -236,10 +234,12 @@ impl FromStr for ExcludeNewerValue {
 
         let span_err = match input.parse::<Span>() {
             Ok(span) => {
-                let now = if let Ok(test_time) = std::env::var("UV_TEST_CURRENT_TIMESTAMP") {
+                let now = if let Ok(test_time) =
+                    std::env::var("UV_INTERNAL__TEST_CURRENT_TIMESTAMP")
+                {
                     test_time
                         .parse::<Timestamp>()
-                        .expect("UV_TEST_CURRENT_TIMESTAMP must be a valid RFC 3339 timestamp")
+                        .expect("UV_INTERNAL__TEST_CURRENT_TIMESTAMP must be a valid RFC 3339 timestamp")
                         .to_zoned(TimeZone::UTC)
                 } else {
                     Timestamp::now().to_zoned(TimeZone::UTC)
@@ -309,6 +309,34 @@ pub enum ExcludeNewerOverride {
     Enabled(Box<ExcludeNewerValue>),
 }
 
+impl ExcludeNewerOverride {
+    /// Return the configured cutoff, or `None` if `exclude-newer` is disabled.
+    pub fn into_value(self) -> Option<ExcludeNewerValue> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(value) => Some(*value),
+        }
+    }
+}
+
+impl From<ExcludeNewerValue> for ExcludeNewerOverride {
+    fn from(value: ExcludeNewerValue) -> Self {
+        Self::Enabled(Box::new(value))
+    }
+}
+
+impl FromStr for ExcludeNewerOverride {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input == "false" {
+            Ok(Self::Disabled)
+        } else {
+            ExcludeNewerValue::from_str(input).map(Self::from)
+        }
+    }
+}
+
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for ExcludeNewerOverride {
     fn schema_name() -> Cow<'static, str> {
@@ -351,8 +379,8 @@ impl<'de> serde::Deserialize<'de> for ExcludeNewerOverride {
                 E: serde::de::Error,
             {
                 ExcludeNewerValue::from_str(v)
-                    .map(|ts| ExcludeNewerOverride::Enabled(Box::new(ts)))
-                    .map_err(|e| E::custom(format!("failed to parse exclude-newer value: {e}")))
+                    .map(ExcludeNewerOverride::from)
+                    .map_err(E::custom)
             }
 
             fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>

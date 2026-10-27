@@ -52,9 +52,9 @@ Every workspace needs a root, which is _also_ a workspace member. In the above e
 is the workspace root, and the workspace members include all projects under the `packages`
 directory, except `seeds`.
 
-By default, `uv run` and `uv sync` operates on the workspace root. For example, in the above
-example, `uv run` and `uv run --package albatross` would be equivalent, while
-`uv run --package bird-feeder` would run the command in the `bird-feeder` package.
+By default, `uv run` and `uv sync` operate on the workspace root. In the example above, `uv run` and
+`uv run --package albatross` would be equivalent, while `uv run --package bird-feeder` would run the
+command in the `bird-feeder` package.
 
 ## Workspace sources
 
@@ -75,14 +75,17 @@ bird-feeder = { workspace = true }
 members = ["packages/*"]
 
 [build-system]
-requires = ["uv_build>=0.11.21,<0.12"]
+requires = ["uv_build>=0.13.6,<0.14"]
 build-backend = "uv_build"
 ```
 
 In this example, the `albatross` project depends on the `bird-feeder` project, which is a member of
 the workspace. The `workspace = true` key-value pair in the `tool.uv.sources` table indicates the
 `bird-feeder` dependency should be provided by the workspace, rather than fetched from PyPI or
-another registry.
+another registry. The `workspace` field can also be set to a path string to resolve a dependency
+from a different workspace. The path is resolved relative to the project that declares the source
+(or the workspace root for a workspace-level source) and must point to the external workspace root.
+uv selects the member that matches the dependency name.
 
 !!! note
 
@@ -106,7 +109,7 @@ tqdm = { git = "https://github.com/tqdm/tqdm" }
 members = ["packages/*"]
 
 [build-system]
-requires = ["uv_build>=0.11.21,<0.12"]
+requires = ["uv_build>=0.13.6,<0.14"]
 build-backend = "uv_build"
 ```
 
@@ -148,7 +151,7 @@ albatross
 ├── uv.lock
 └── src
     └── albatross
-        └── main.py
+        └── __init__.py
 ```
 
 Since `seeds` was excluded in the `pyproject.toml`, the workspace has two members total: `albatross`
@@ -188,7 +191,7 @@ dependencies = ["bird-feeder", "tqdm>=4,<5"]
 bird-feeder = { path = "packages/bird-feeder" }
 
 [build-system]
-requires = ["uv_build>=0.11.21,<0.12"]
+requires = ["uv_build>=0.13.6,<0.14"]
 build-backend = "uv_build"
 ```
 

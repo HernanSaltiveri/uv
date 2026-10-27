@@ -86,13 +86,13 @@ Then, in `example`, plugins would be loaded with:
 ```python title="example/__init__.py"
 from importlib.metadata import entry_points
 
-for plugin in entry_points(group='example.plugins'):
+for plugin in entry_points(group="example.plugins"):
     plugin.load()
 ```
 
 !!! note
 
-    The `group` key can be an arbitrary value, it does not need to include the package name or
+    The `group` key can be an arbitrary value; it does not need to include the package name or
     "plugins". However, it is recommended to namespace the key by the package name to avoid
     collisions with other packages.
 
@@ -106,9 +106,9 @@ installed in the project virtual environment. If a build system is not defined, 
 to build or install the project itself, just its dependencies. If a build system is defined, uv will
 build and install the project into the project environment.
 
-The `--build-backend` option can be provided to `uv init` to create a packaged project with an
-appropriate layout. The `--package` option can be provided to `uv init` to create a packaged project
-with the default build system.
+By default, `uv init` creates a packaged project using the [uv build backend](../build-backend.md).
+The `--build-backend` option can be provided to select an alternative build backend, and
+`--no-package` can be provided to create a flat, unpackaged project instead.
 
 !!! note
 
@@ -275,6 +275,11 @@ deepspeed = [{ requirement = "torch", match-runtime = true }]
 This will ensure that `deepspeed` is built with the same version of `torch` that is installed in the
 project environment.
 
+!!! tip
+
+    Pre-built `deepspeed` wheels are also available from the
+    [Astral GPU indexes](../../guides/integration/pytorch.md#installing-gpu-enabled-pytorch-extensions).
+
 Similarly, to build `flash-attn` with `torch` as an additional build dependency, include the
 following in your `pyproject.toml`:
 
@@ -305,6 +310,11 @@ flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
     to `TRUE` can lead to an incompatible install if no compatible pre-built wheel is available
     for the target PyTorch version, GPU version, and platform.
 
+!!! tip
+
+    Pre-built `flash-attn` wheels are also available from the
+    [Astral GPU indexes](../../guides/integration/pytorch.md#installing-gpu-enabled-pytorch-extensions).
+
 Similarly, [`deep_gemm`](https://github.com/deepseek-ai/DeepGEMM) follows the same pattern:
 
 ```toml title="pyproject.toml"
@@ -323,7 +333,12 @@ deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM" }
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
 ```
 
-The use of `extra-build-dependencies` and `extra-build-variables` are tracked in the uv cache, such
+!!! tip
+
+    Pre-built `deep_gemm` wheels are also available from the
+    [Astral GPU indexes](../../guides/integration/pytorch.md#installing-gpu-enabled-pytorch-extensions).
+
+The use of `extra-build-dependencies` and `extra-build-variables` is tracked in the uv cache, such
 that changes to these settings will trigger a reinstall and rebuild of the affected packages. For
 example, in the case of `flash-attn`, upgrading the version of `torch` used in your project would
 subsequently trigger a rebuild of `flash-attn` with the new version of `torch`.
@@ -507,7 +522,7 @@ Some packages, like `cchardet`, only require build dependencies for the _install
 dependencies during the _resolution_ phase.
 
 In such cases, the build dependencies can be installed prior to running any `uv lock` or `uv sync`
-commands, using the lower lower-level `uv pip` API. For example, given:
+commands, using the lower-level `uv pip` API. For example, given:
 
 ```toml title="pyproject.toml"
 [project]
@@ -617,3 +632,6 @@ distribution (like PyTorch), as such packages can _only_ be installed on environ
 set of pre-built binary distributions (wheels) published by that package.
 
 See the [resolution documentation](../resolution.md#required-environments) for more.
+
+For Linux, use [`minimum-libc-version`](../resolution.md#minimum-libc-version) alongside
+`required-environments` to select the libc implementations and minimum versions to support.

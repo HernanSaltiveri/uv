@@ -1,15 +1,22 @@
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
 use anyhow::{Ok, Result};
 use assert_cmd::assert::OutputAssertExt;
 use assert_fs::prelude::*;
 use indoc::indoc;
 use insta::assert_snapshot;
 
-use uv_test::uv_snapshot;
+use uv_static::EnvVars;
+use uv_test::{apply_filters, uv_snapshot};
 
 // Print the version
 #[test]
 fn version_get() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[]);
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -22,15 +29,12 @@ fn version_get() -> Result<()> {
     )?;
 
     uv_snapshot!(context.filters(), context.version(), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -47,7 +51,7 @@ fn version_get() -> Result<()> {
 // Print the version (json format)
 #[test]
 fn version_get_json() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[]);
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -59,21 +63,31 @@ fn version_get_json() -> Result<()> {
         "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.version()
+    let output = uv_snapshot!(context.filters(), context.version()
         .arg("--output-format").arg("json"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     {
       "package_name": "myproject",
       "version": "1.10.31",
       "commit_info": null
     }
-
-    ----- stderr -----
     "#);
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    context
+        .version()
+        .args(["--output-format", "json", "--quiet"])
+        .assert()
+        .success()
+        .stdout(String::from_utf8(output.stdout)?);
+    context
+        .version()
+        .args(["--output-format", "json", "-qq"])
+        .assert()
+        .success()
+        .stdout("");
+
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -90,7 +104,7 @@ fn version_get_json() -> Result<()> {
 // Print the version (--short)
 #[test]
 fn version_get_short() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[]);
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -104,15 +118,12 @@ fn version_get_short() -> Result<()> {
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--short"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     1.10.31
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -144,8 +155,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("1.1.1"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.1.1
 
@@ -154,7 +164,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -187,8 +197,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("1.1.1")
         .arg("--short"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     1.1.1
 
@@ -197,7 +206,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -229,8 +238,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.10.32
 
@@ -239,7 +247,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -269,8 +277,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch=40"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.10.40
 
@@ -279,7 +286,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -309,8 +316,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("minor=10"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.2.3 => 1.10.0
 
@@ -319,7 +325,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -349,8 +355,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major=7"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 2.3.4 => 7.0.0
 
@@ -359,7 +364,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -391,8 +396,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch")
         .arg("--short"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     1.10.32
 
@@ -401,7 +405,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -431,15 +435,12 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch=11"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 0.0.12 => 0.0.11 didn't increase the version; provide the exact version to force an update
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -480,7 +481,7 @@ fn version_bump_preserves_preceding_comments() -> Result<()> {
         .success();
 
     // Ensure comments are preserved around the version entry
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
         @r#"
@@ -515,8 +516,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("minor"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.11.0
 
@@ -525,7 +525,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -556,8 +556,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 2.0.0
 
@@ -566,7 +565,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -597,8 +596,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.1 => 0.1.1
 
@@ -607,7 +605,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -638,8 +636,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("minor"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.1 => 0.2
 
@@ -648,7 +645,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -679,8 +676,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.1 => 1.0
 
@@ -689,7 +685,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -720,8 +716,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31.dev10 => 2.0.0
 
@@ -730,7 +725,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -761,8 +756,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1!2a3.post4.dev5+deadbeef6 => 1!3+deadbeef6
 
@@ -771,7 +765,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -812,15 +806,12 @@ requires-python = ">=3.12"
         .arg("--bump").arg("minor")
         .arg("--bump").arg("post")
         .arg("--bump").arg("post"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `--bump post` cannot be used with another `--bump` value, got: major, patch, alpha, minor, dev, minor, post, post
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -851,8 +842,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("stable"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4+deadbeef6
 
@@ -861,7 +851,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -892,8 +882,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("alpha"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4a6+deadbeef6
 
@@ -902,7 +891,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -933,8 +922,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("beta"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4b1+deadbeef6
 
@@ -943,7 +931,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -973,8 +961,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("beta=42"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.2.3b4 => 1.2.3b42
 
@@ -983,7 +970,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1014,8 +1001,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("beta=5")
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.2.3 => 1.2.4b5
 
@@ -1024,7 +1010,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1055,8 +1041,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("rc"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4rc1+deadbeef6
 
@@ -1065,7 +1050,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1096,8 +1081,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("post"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4a5.post7+deadbeef6
 
@@ -1106,7 +1090,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1136,8 +1120,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("post=10"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.2.3.post4.dev9 => 1.2.3.post10
 
@@ -1146,7 +1129,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1177,8 +1160,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 9!2.3.4a5.post6.dev7+deadbeef6 => 9!2.3.4a5.post6.dev8+deadbeef6
 
@@ -1187,7 +1169,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1217,8 +1199,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev=42"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.1.0.dev4 => 0.1.0.dev42
 
@@ -1227,7 +1208,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1258,8 +1239,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch")
         .arg("--bump").arg("dev=66463664"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.0.1 => 0.0.2.dev66463664
 
@@ -1268,7 +1248,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1299,8 +1279,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev=0")
         .arg("--bump").arg("patch=10"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 0.1.2.dev3 => 0.1.10.dev0
 
@@ -1309,7 +1288,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1340,8 +1319,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31.post10 => 2.0.0
 
@@ -1350,7 +1328,7 @@ requires-python = ">=3.12"
     Checked in [TIME]
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1361,6 +1339,61 @@ requires-python = ">=3.12"
     requires-python = ">=3.12"
     "#
     );
+    Ok(())
+}
+
+#[test]
+fn bump_invalid_component_fails() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "myproject"
+            version = "1.2.3"
+            requires-python = ">=3.12"
+        "#})?;
+
+    let output = uv_snapshot!(context.filters(), context.version()
+        .arg("--bump").arg("foo"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: invalid bump component `foo`
+
+    Usage: uv version [OPTIONS] [VALUE]
+
+    For more information, try '--help'.
+    ");
+
+    assert!(output.stderr.ends_with(b"\n"));
+
+    Ok(())
+}
+
+#[test]
+fn bump_invalid_component_color() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let output = context
+        .version()
+        .arg("--bump")
+        .arg("foo")
+        .env_remove(EnvVars::NO_COLOR)
+        .env(EnvVars::CLICOLOR_FORCE, "1")
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = apply_filters(
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        context.filters(),
+    );
+    assert_snapshot!(
+        format!("{stderr:?}"),
+        @r#""\u{1b}[1m\u{1b}[31merror:\u{1b}[0m invalid bump component `foo`\n\n\u{1b}[1m\u{1b}[32mUsage:\u{1b}[0m \u{1b}[1m\u{1b}[36muv version\u{1b}[0m \u{1b}[36m[OPTIONS]\u{1b}[0m \u{1b}[36m[VALUE]\u{1b}[0m\n\nFor more information, try '\u{1b}[1m\u{1b}[36m--help\u{1b}[0m'.\n""#
+    );
+
     Ok(())
 }
 
@@ -1380,12 +1413,13 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("stable=1"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `--bump stable` does not accept a value
+
+    Usage: uv version [OPTIONS] [VALUE]
+
+    For more information, try '--help'.
     ");
     Ok(())
 }
@@ -1406,12 +1440,13 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch="), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `--bump` values cannot be empty
+
+    Usage: uv version [OPTIONS] [VALUE]
+
+    For more information, try '--help'.
     ");
     Ok(())
 }
@@ -1432,12 +1467,13 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev=foo"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: invalid numeric value `foo` for `--bump dev`
+
+    Usage: uv version [OPTIONS] [VALUE]
+
+    For more information, try '--help'.
     ");
     Ok(())
 }
@@ -1459,10 +1495,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("stable"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 2.3.4.post6 => 2.3.4 didn't increase the version; provide the exact version to force an update
     ");
@@ -1486,10 +1519,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("alpha"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 2.3.4b5 => 2.3.4a1 didn't increase the version; provide the exact version to force an update
     ");
@@ -1513,10 +1543,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("alpha"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 2.3.4 => 2.3.4a1 didn't increase the version; when bumping to a pre-release version you also need to increase a release version component, e.g., with `--bump <major|minor|patch>`
     ");
@@ -1540,10 +1567,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 2.3.4 => 2.3.4.dev1 didn't increase the version; when bumping to a dev version you also need to increase another version component, e.g., with `--bump <major|minor|patch|alpha|beta|rc>`
     ");
@@ -1567,10 +1591,7 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("dev"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: 2.3.4a1 => 2.3.4a1.dev1 didn't increase the version; when bumping to a dev version you also need to increase another version component, e.g., with `--bump <major|minor|patch|alpha|beta|rc>`
     ");
@@ -1595,10 +1616,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
         .arg("--bump").arg("major"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Only one release version component can be provided to `--bump`, got: major, major
     ");
@@ -1623,10 +1641,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("alpha")
         .arg("--bump").arg("alpha"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Only one pre-release version component can be provided to `--bump`, got: alpha, alpha
     ");
@@ -1651,10 +1666,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("stable")
         .arg("--bump").arg("major"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `--bump stable` cannot be used with another `--bump` value, got: stable, major
     ");
@@ -1679,8 +1691,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
         .arg("--bump").arg("alpha"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 2.3.4 => 3.0.0a1
 
@@ -1708,15 +1719,10 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
-        .arg("--bump").arg("alpha"), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-    myproject 2.3.4 => 3.0.0a1
-
+        .arg("--bump").arg("minor"), @"
+    exit_code: 2 (failure)
     ----- stderr -----
-    Resolved 1 package in [TIME]
-    Checked in [TIME]
+    error: Only one release version component can be provided to `--bump`, got: major, minor
     ");
     Ok(())
 }
@@ -1739,10 +1745,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("alpha")
         .arg("--bump").arg("dev"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Only one pre-release version component can be provided to `--bump`, got: alpha, dev
     ");
@@ -1767,8 +1770,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
         .arg("--bump").arg("dev"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 2.3.4 => 3.0.0.dev1
 
@@ -1797,10 +1799,7 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
         .arg("--bump").arg("post"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: `--bump post` cannot be used with another `--bump` value, got: major, post
     ");
@@ -1825,15 +1824,12 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("1.2.3")
         .arg("--dry-run"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.2.3
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1865,15 +1861,12 @@ requires-python = ">=3.12"
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("major")
         .arg("--dry-run"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 2.0.0
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1904,15 +1897,12 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("abcd"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: expected version to start with a number, but no leading ASCII digits were found
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1943,15 +1933,12 @@ requires-python = ">=3.12"
 
     uv_snapshot!(context.filters(), context.version()
         .arg("minor"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: Invalid version `minor`, did you mean to pass `--bump minor`?
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -1981,15 +1968,12 @@ fn version_get_dynamic() -> Result<()> {
     )?;
 
     uv_snapshot!(context.filters(), context.version(), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: We cannot get or set dynamic project versions in: pyproject.toml
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2051,8 +2035,7 @@ fn version_preserves_existing_sources_during_staged_update() -> Result<()> {
         .version()
         .arg("0.2.0")
         .arg("--no-sync"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     project 0.1.0 => 0.2.0
 
@@ -2080,15 +2063,12 @@ fn version_set_dynamic() -> Result<()> {
 
     uv_snapshot!(context.filters(), context.version()
         .arg("0.1.2"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: We cannot get or set dynamic project versions in: pyproject.toml
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2121,15 +2101,12 @@ fn version_get_fallback_unmanaged() -> Result<()> {
     )?;
 
     uv_snapshot!(context.filters(), context.version(), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The project is marked as unmanaged: [TEMP_DIR]/
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2172,15 +2149,12 @@ fn version_get_fallback_unmanaged_short() -> Result<()> {
         .collect::<Vec<_>>();
     uv_snapshot!(filters, context.version()
         .arg("--short"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The project is marked as unmanaged: [TEMP_DIR]/
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2196,20 +2170,20 @@ fn version_get_fallback_unmanaged_short() -> Result<()> {
     Ok(())
 }
 
-/// In tarball builds of uv, git version info is missing (distros do this)
+/// Whether this build should include Git metadata in its version output.
 fn git_version_info_expected() -> bool {
-    // This is setup to aggressively panic to make sure this is working at all
-    // If you're a packager of uv and this does indeed blow up for you, we will
-    // gladly change these expects into "just return false" or something.
-    let manifest_dir = std::env::var(uv_static::EnvVars::CARGO_MANIFEST_DIR)
-        .expect("CARGO_MANIFEST_DIR not defined");
-    let git_dir = std::path::Path::new(&manifest_dir)
+    if env!("PROFILE") != "release" && option_env!("UV_INTERNAL__BUILD_GIT_INFO") != Some("1") {
+        return false;
+    }
+
+    let manifest_dir =
+        std::env::var(EnvVars::CARGO_MANIFEST_DIR).expect("CARGO_MANIFEST_DIR not defined");
+    let workspace_root = Path::new(&manifest_dir)
         .parent()
         .expect("parent of manifest dir missing")
         .parent()
-        .expect("grandparent of manifest dir missing")
-        .join(".git");
-    git_dir.exists()
+        .expect("grandparent of manifest dir missing");
+    workspace_root.join(".git").exists() && !workspace_root.join(".jj").exists()
 }
 
 // Should error if this pyproject.toml isn't usable for whatever reason
@@ -2232,15 +2206,12 @@ fn version_get_fallback_unmanaged_strict() -> Result<()> {
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--project").arg("."), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: The project is marked as unmanaged: [TEMP_DIR]/
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2264,10 +2235,7 @@ fn version_get_fallback_missing_strict() -> Result<()> {
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--project").arg("."), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `pyproject.toml` found in current directory or any parent directory
     ");
@@ -2281,10 +2249,7 @@ fn version_get_missing_with_hint() -> Result<()> {
     let context = uv_test::test_context!("3.12");
 
     uv_snapshot!(context.filters(), context.version(), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `pyproject.toml` found in current directory or any parent directory
 
@@ -2298,7 +2263,7 @@ fn version_get_missing_with_hint() -> Result<()> {
 // (also setup a honeypot project and make sure it's not used)
 #[test]
 fn self_version() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[]);
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -2310,15 +2275,12 @@ fn self_version() -> Result<()> {
     )?;
 
     uv_snapshot!(context.filters(), context.self_version(), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     uv [VERSION] ([COMMIT] DATE)
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2335,7 +2297,7 @@ fn self_version() -> Result<()> {
 // (also setup a honeypot project and make sure it's not used)
 #[test]
 fn self_version_short() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[]);
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -2353,15 +2315,12 @@ fn self_version_short() -> Result<()> {
         .collect::<Vec<_>>();
     uv_snapshot!(filters, context.self_version()
         .arg("--short"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     [VERSION]
-
-    ----- stderr -----
     ");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2378,7 +2337,23 @@ fn self_version_short() -> Result<()> {
 // (also setup a honeypot project and make sure it's not used)
 #[test]
 fn self_version_json() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context_with_versions!(&[])
+        .with_filter((
+            r#"version": "\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?(\+\d+)?""#,
+            r#"version": "[VERSION]""#,
+        ))
+        .with_filter((
+            r#""short_commit_hash": ".*""#,
+            r#""short_commit_hash": "[HASH]""#,
+        ))
+        .with_filter((r#""commit_hash": ".*""#, r#""commit_hash": "[LONGHASH]""#))
+        .with_filter((r#"commit_date": ".*""#, r#"commit_date": "[DATE]""#))
+        .with_filter((r#"last_tag": (".*"|null)"#, r#"last_tag": "[TAG]""#))
+        .with_filter((
+            r#"commits_since_last_tag": .*"#,
+            r#"commits_since_last_tag": [COUNT]"#,
+        ))
+        .with_filter((r#"target_triple": ".*""#, r#"target_triple": "[TARGET]""#));
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -2389,40 +2364,16 @@ fn self_version_json() -> Result<()> {
         "#,
     )?;
 
-    let filters = context
-        .filters()
-        .into_iter()
-        .chain([
-            (
-                r#"version": "\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?(\+\d+)?""#,
-                r#"version": "[VERSION]""#,
-            ),
-            (
-                r#"short_commit_hash": ".*""#,
-                r#"short_commit_hash": "[HASH]""#,
-            ),
-            (r#"commit_hash": ".*""#, r#"commit_hash": "[LONGHASH]""#),
-            (r#"commit_date": ".*""#, r#"commit_date": "[DATE]""#),
-            (r#"last_tag": (".*"|null)"#, r#"last_tag": "[TAG]""#),
-            (
-                r#"commits_since_last_tag": .*"#,
-                r#"commits_since_last_tag": [COUNT]"#,
-            ),
-            (r#"target_triple": ".*""#, r#"target_triple": "[TARGET]""#),
-        ])
-        .collect::<Vec<_>>();
-
-    if git_version_info_expected() {
-        uv_snapshot!(filters, context.self_version()
+    let output = if git_version_info_expected() {
+        uv_snapshot!(context.filters(), context.self_version()
           .arg("--output-format").arg("json"), @r#"
-        success: true
-        exit_code: 0
+        exit_code: 0 (success)
         ----- stdout -----
         {
           "package_name": "uv",
           "version": "[VERSION]",
           "commit_info": {
-            "short_commit_hash": "[LONGHASH]",
+            "short_commit_hash": "[HASH]",
             "commit_hash": "[LONGHASH]",
             "commit_date": "[DATE]",
             "last_tag": "[TAG]",
@@ -2430,14 +2381,11 @@ fn self_version_json() -> Result<()> {
           },
           "target_triple": "[TARGET]"
         }
-
-        ----- stderr -----
-        "#);
+        "#)
     } else {
-        uv_snapshot!(filters, context.self_version()
+        uv_snapshot!(context.filters(), context.self_version()
           .arg("--output-format").arg("json"), @r#"
-      success: true
-      exit_code: 0
+      exit_code: 0 (success)
       ----- stdout -----
       {
         "package_name": "uv",
@@ -2445,12 +2393,23 @@ fn self_version_json() -> Result<()> {
         "commit_info": null,
         "target_triple": "[TARGET]"
       }
+      "#)
+    };
 
-      ----- stderr -----
-      "#);
-    }
+    context
+        .self_version()
+        .args(["--output-format", "json", "--quiet"])
+        .assert()
+        .success()
+        .stdout(String::from_utf8(output.stdout)?);
+    context
+        .self_version()
+        .args(["--output-format", "json", "-qq"])
+        .assert()
+        .success()
+        .stdout("");
 
-    let pyproject = fs_err::read_to_string(&pyproject_toml)?;
+    let pyproject = context.read("pyproject.toml");
     assert_snapshot!(
         pyproject,
     @r#"
@@ -2486,40 +2445,28 @@ fn version_get_workspace() -> Result<()> {
         .success();
 
     uv_snapshot!(context.filters(), context.version().arg("--project").arg(context.temp_dir.as_ref()), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31
-
-    ----- stderr -----
     ");
 
     uv_snapshot!(context.filters(), context.version().arg("--project").arg(context.temp_dir.join("workspace-member")), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     workspace-member 0.1.0
-
-    ----- stderr -----
     ");
 
     // Check that --directory also works
     uv_snapshot!(context.filters(), context.version().arg("--directory").arg(context.temp_dir.as_ref()), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31
-
-    ----- stderr -----
     ");
 
     uv_snapshot!(context.filters(), context.version().arg("--directory").arg(context.temp_dir.join("workspace-member")), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     workspace-member 0.1.0
-
-    ----- stderr -----
     ");
 
     pyproject_toml.write_str(
@@ -2533,10 +2480,7 @@ fn version_get_workspace() -> Result<()> {
     // TODO(konsti): Show a dedicated error message for virtual workspace roots (generally, not
     // only for `uv version`)
     uv_snapshot!(context.filters(), context.version().arg("--project").arg(context.temp_dir.as_ref()), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
@@ -2560,12 +2504,235 @@ fn version_virtual_workspace_root_rejects_before_members() -> Result<()> {
     workspace_member.child("README.md").touch()?;
 
     uv_snapshot!(context.filters(), context.version(), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
+    ");
+
+    Ok(())
+}
+
+/// Read the frozen version of a workspace member without discovering an interpreter.
+#[test]
+fn version_get_frozen_workspace_without_python() -> Result<()> {
+    let context = uv_test::test_context!("3.12")
+        .with_cache_dir("cache-file")
+        .with_filter((
+            r"cause: failed to create directory `[^`]+`: .*",
+            "cause: failed to create directory `[CACHE_DIR]`: [ERROR]",
+        ));
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [tool.uv.workspace]
+            members = ["child"]
+        "#})?;
+
+    context
+        .temp_dir
+        .child("child/pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "child"
+            version = "2.0.0"
+            requires-python = ">=3.12"
+        "#})?;
+
+    context.temp_dir.child("uv.lock").write_str(indoc! {r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.12"
+
+        [manifest]
+        members = ["child"]
+
+        [[package]]
+        name = "child"
+        version = "1.0.0"
+        source = { editable = "child" }
+    "#})?;
+
+    // A file can't be initialized as a cache directory.
+    context.cache_dir.touch()?;
+
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--package").arg("child")
+        .arg("--short"), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    2.0.0
+    ");
+
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--package").arg("child")
+        .arg("--frozen")
+        .arg("--python").arg("9.9")
+        .arg("--no-python-downloads"), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    child 1.0.0
+    ");
+
+    // Writing a version initializes the cache, confirming that the cache path is invalid.
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--package").arg("child")
+        .arg("--frozen")
+        .arg("--bump").arg("patch"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to initialize cache at `cache-file`
+      cause: failed to create directory `[CACHE_DIR]`: [ERROR]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn version_bump_locked_preserves_pyproject() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "myproject"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--bump").arg("minor")
+        .arg("--locked"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
+    ");
+
+    // A failed version change should leave the project and lockfile consistent.
+    assert_snapshot!(context.read("pyproject.toml"), @r#"
+    [project]
+    name = "myproject"
+    version = "0.1.0"
+    requires-python = ">=3.12"
+    "#);
+    assert_snapshot!(context.read("uv.lock"), @r#"
+    version = 1
+    revision = 5
+    requires-python = ">=3.12"
+
+    [options]
+    exclude-newer = "2024-03-25T00:00:00Z"
+
+    [[package]]
+    name = "myproject"
+    version = "0.1.0"
+    source = { virtual = "." }
+    "#);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn version_bump_locked_readonly_workspace() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let workspace = context.temp_dir.child("pyproject.toml");
+    workspace.write_str(indoc! {r#"
+        [tool.uv.workspace]
+        members = ["member"]
+    "#})?;
+    context
+        .temp_dir
+        .child("member/pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "myproject"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    ");
+    let lock = context.read("uv.lock");
+
+    // Updating a member does not require writing to the workspace's metadata.
+    fs_err::set_permissions(&workspace, Permissions::from_mode(0o444))?;
+
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--package").arg("myproject")
+        .arg("--bump").arg("minor")
+        .arg("--locked")
+        .arg("--no-sync"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
+    ");
+
+    assert_snapshot!(context.read("member/pyproject.toml"), @r#"
+    [project]
+    name = "myproject"
+    version = "0.1.0"
+    requires-python = ">=3.12"
+    "#);
+    assert_eq!(context.read("uv.lock"), lock);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn version_bump_frozen_unreadable_lockfile() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "myproject"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+        "#})?;
+    let lock = context.temp_dir.child("uv.lock");
+    lock.write_str("unreadable lockfile\n")?;
+    fs_err::set_permissions(&lock, Permissions::from_mode(0o000))?;
+
+    uv_snapshot!(context.filters(), context.version()
+        .arg("--bump").arg("minor")
+        .arg("--frozen"), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    myproject 0.1.0 => 0.2.0
+    ");
+
+    assert_snapshot!(context.read("pyproject.toml"), @r#"
+    [project]
+    name = "myproject"
+    version = "0.2.0"
+    requires-python = ">=3.12"
+    "#);
+    fs_err::set_permissions(&lock, Permissions::from_mode(0o644))?;
+    assert_snapshot!(context.read("uv.lock"), @"
+    unreadable lockfile
     ");
 
     Ok(())
@@ -2596,8 +2763,8 @@ fn version_set_workspace() -> Result<()> {
         ]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         child2 = { workspace = true }
@@ -2619,8 +2786,8 @@ fn version_set_workspace() -> Result<()> {
         dependencies = []
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     context
         .temp_dir
@@ -2632,15 +2799,10 @@ fn version_set_workspace() -> Result<()> {
 
     // Set one child's version, creating the lock and initial sync
     let mut version_cmd = context.version();
-    version_cmd
-        .arg("--package")
-        .arg("child2")
-        .arg("1.1.1")
-        .current_dir(&context.temp_dir);
+    version_cmd.arg("--package").arg("child2").arg("1.1.1");
 
     uv_snapshot!(context.filters(), version_cmd, @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child2 0.1.0 => 1.1.1
 
@@ -2660,7 +2822,7 @@ fn version_set_workspace() -> Result<()> {
         assert_snapshot!(
             lock, @r#"
         version = 1
-        revision = 3
+        revision = 5
         requires-python = ">=3.12"
 
         [options]
@@ -2693,15 +2855,10 @@ fn version_set_workspace() -> Result<()> {
 
     // Set the other child's version, refreshing the lock and sync
     let mut version_cmd = context.version();
-    version_cmd
-        .arg("--package")
-        .arg("child1")
-        .arg("1.2.3")
-        .current_dir(&context.temp_dir);
+    version_cmd.arg("--package").arg("child1").arg("1.2.3");
 
     uv_snapshot!(context.filters(), version_cmd, @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child1 0.1.0 => 1.2.3
 
@@ -2720,7 +2877,7 @@ fn version_set_workspace() -> Result<()> {
         assert_snapshot!(
             lock, @r#"
         version = 1
-        revision = 3
+        revision = 5
         requires-python = ">=3.12"
 
         [options]
@@ -2755,36 +2912,27 @@ fn version_set_workspace() -> Result<()> {
     uv_snapshot!(context.filters(), context.version()
         .arg("--package").arg("child1")
         .arg("--locked"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child1 1.2.3
-
-    ----- stderr -----
     ");
 
     // Confirm --frozen get works fine
     uv_snapshot!(context.filters(), context.version()
         .arg("--package").arg("child2")
         .arg("--frozen"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child2 1.1.1
-
-    ----- stderr -----
     ");
 
     // Confirm --no-sync get works fine
     uv_snapshot!(context.filters(), context.version()
         .arg("--package").arg("child1")
         .arg("--no-sync"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child1 1.2.3
-
-    ----- stderr -----
     ");
 
     // Confirm --frozen set works
@@ -2792,12 +2940,9 @@ fn version_set_workspace() -> Result<()> {
         .arg("--package").arg("child2")
         .arg("--frozen")
         .arg("2.0.0"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child2 1.1.1 => 2.0.0
-
-    ----- stderr -----
     ");
 
     // Confirm --frozen --bump works, sees the previous set
@@ -2805,24 +2950,18 @@ fn version_set_workspace() -> Result<()> {
         .arg("--package").arg("child2")
         .arg("--frozen")
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child2 2.0.0 => 2.0.1
-
-    ----- stderr -----
     ");
 
     // Confirm --frozen get doesn't see the --frozen set or bump
     uv_snapshot!(context.filters(), context.version()
         .arg("--package").arg("child2")
         .arg("--frozen"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child2 1.1.1
-
-    ----- stderr -----
     ");
 
     // Confirm --no-sync set does a lock but no sync
@@ -2830,8 +2969,7 @@ fn version_set_workspace() -> Result<()> {
         .arg("--package").arg("child1")
         .arg("--no-sync")
         .arg("3.0.0"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child1 1.2.3 => 3.0.0
 
@@ -2847,7 +2985,7 @@ fn version_set_workspace() -> Result<()> {
         assert_snapshot!(
             lock, @r#"
         version = 1
-        revision = 3
+        revision = 5
         requires-python = ">=3.12"
 
         [options]
@@ -2883,8 +3021,7 @@ fn version_set_workspace() -> Result<()> {
         .arg("--package").arg("child1")
         .arg("--locked")
         .arg("3.0.0"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     child1 3.0.0 => 3.0.0
 
@@ -2936,8 +3073,8 @@ fn version_set_evil_constraints() -> Result<()> {
         dependencies = []
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     context
         .temp_dir
@@ -2958,8 +3095,8 @@ fn version_set_evil_constraints() -> Result<()> {
         ]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     context
         .temp_dir
@@ -2971,10 +3108,7 @@ fn version_set_evil_constraints() -> Result<()> {
 
     // sync all, creating the lock and initial sync
     uv_snapshot!(context.filters(),  context.sync(), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
     Prepared 4 packages in [TIME]
@@ -2993,7 +3127,7 @@ fn version_set_evil_constraints() -> Result<()> {
         assert_snapshot!(
             lock, @r#"
         version = 1
-        revision = 3
+        revision = 5
         requires-python = ">=3.12"
 
         [options]
@@ -3050,15 +3184,10 @@ fn version_set_evil_constraints() -> Result<()> {
     // This will not appear in the sync, but it will show up in the lock,
     // because we use "sufficient" sync semantics
     let mut version_cmd = context.version();
-    version_cmd
-        .arg("--project")
-        .arg("idna")
-        .arg("2.0.0")
-        .current_dir(&context.temp_dir);
+    version_cmd.arg("--project").arg("idna").arg("2.0.0");
 
     uv_snapshot!(context.filters(), version_cmd, @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     idna 3.10.0 => 2.0.0
 
@@ -3079,7 +3208,7 @@ fn version_set_evil_constraints() -> Result<()> {
         assert_snapshot!(
             lock, @r#"
         version = 1
-        revision = 3
+        revision = 5
         requires-python = ">=3.12"
 
         [options]
@@ -3143,10 +3272,7 @@ fn version_set_evil_constraints() -> Result<()> {
 
     // however once we explicitly sync the change will go into effect
     uv_snapshot!(context.filters(),  context.sync(), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 5 packages in [TIME]
     Prepared 2 packages in [TIME]
@@ -3174,10 +3300,7 @@ fn virtual_empty() -> Result<()> {
     // Get version (doesn't make sense)
     uv_snapshot!(context.filters(), context.version()
         .arg("sortedcontainers"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
@@ -3198,10 +3321,7 @@ fn virtual_empty() -> Result<()> {
     // Set version (can make sense, but we should still refuse?)
     uv_snapshot!(context.filters(), context.version()
         .arg("1.0.0"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
@@ -3239,10 +3359,7 @@ fn add_virtual_dependency_group() -> Result<()> {
 
     // Get the version (doesn't make sense)
     uv_snapshot!(context.filters(), context.version(), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
@@ -3265,10 +3382,7 @@ fn add_virtual_dependency_group() -> Result<()> {
     // Set the version (can make sense, we should refuse?)
     uv_snapshot!(context.filters(), context.version()
         .arg("1.0.0"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: No `project` table found in: [TEMP_DIR]/pyproject.toml
     ");
@@ -3318,8 +3432,7 @@ conflicts = [[{"extra" = "foo"}, {"extra" = "bar"}]]
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.31 => 1.10.32
 
@@ -3333,8 +3446,7 @@ conflicts = [[{"extra" = "foo"}, {"extra" = "bar"}]]
 
     uv_snapshot!(context.filters(), context.version()
         .arg("--bump").arg("patch"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     myproject 1.10.32 => 1.10.33
 

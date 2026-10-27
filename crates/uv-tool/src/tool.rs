@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use toml_edit::{Array, Item, Table, Value, value};
 
-use uv_distribution_types::Requirement;
+use uv_configuration::ExcludeDependency;
+use uv_distribution_types::{NameRequirementSpecification, Requirement};
 use uv_fs::{PortablePath, Simplified};
-use uv_normalize::PackageName;
+use uv_macros::DeserializeUntagged;
 use uv_pypi_types::VerbatimParsedUrl;
-use uv_python::PythonRequest;
+use uv_python_types::PythonRequest;
 use uv_settings::{ToolOptions, ToolOptionsWire};
 
 /// A tool entry.
@@ -25,9 +26,9 @@ pub struct Tool {
     /// The overrides requested by the user during installation.
     overrides: Vec<Requirement>,
     /// The excludes requested by the user during installation.
-    excludes: Vec<PackageName>,
+    excludes: Vec<ExcludeDependency>,
     /// The build constraints requested by the user during installation.
-    build_constraints: Vec<Requirement>,
+    build_constraints: Vec<NameRequirementSpecification>,
     /// The Python requested by the user during installation.
     python: Option<PythonRequest>,
     /// A mapping of entry point names to their metadata.
@@ -46,22 +47,23 @@ struct ToolWire {
     #[serde(default)]
     overrides: Vec<Requirement>,
     #[serde(default)]
-    excludes: Vec<PackageName>,
+    excludes: Vec<ExcludeDependency>,
     #[serde(default)]
-    build_constraint_dependencies: Vec<Requirement>,
+    build_constraint_dependencies: Vec<NameRequirementSpecification>,
     python: Option<PythonRequest>,
     entrypoints: Vec<ToolEntrypoint>,
     #[serde(default)]
     options: ToolOptionsWire,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeUntagged)]
 enum RequirementWire {
     /// A [`Requirement`] following our uv-specific schema.
+    #[untagged(map)]
     Requirement(Requirement),
     /// A PEP 508-compatible requirement. We no longer write these, but there might be receipts out
     /// there that still use them.
+    #[untagged(string)]
     Deprecated(uv_pep508::Requirement<VerbatimParsedUrl>),
 }
 
@@ -118,26 +120,26 @@ pub struct ToolEntrypoint {
 
 impl Display for ToolEntrypoint {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        #[cfg(windows)]
-        {
-            write!(
-                f,
-                "{} ({})",
-                self.name,
-                self.install_path
-                    .simplified_display()
-                    .to_string()
-                    .replace('/', "\\")
-            )
-        }
-        #[cfg(unix)]
-        {
-            write!(
-                f,
-                "{} ({})",
-                self.name,
-                self.install_path.simplified_display()
-            )
+        cfg_select! {
+            windows => {
+                write!(
+                    f,
+                    "{} ({})",
+                    self.name,
+                    self.install_path
+                        .simplified_display()
+                        .to_string()
+                        .replace('/', "\\")
+                )
+            },
+            unix => {
+                write!(
+                    f,
+                    "{} ({})",
+                    self.name,
+                    self.install_path.simplified_display()
+                )
+            },
         }
     }
 }
@@ -175,8 +177,8 @@ impl Tool {
         requirements: Vec<Requirement>,
         constraints: Vec<Requirement>,
         overrides: Vec<Requirement>,
-        excludes: Vec<PackageName>,
-        build_constraints: Vec<Requirement>,
+        excludes: Vec<ExcludeDependency>,
+        build_constraints: Vec<NameRequirementSpecification>,
         python: Option<PythonRequest>,
         entrypoints: impl IntoIterator<Item = ToolEntrypoint>,
         options: ToolOptions,
@@ -367,11 +369,11 @@ impl Tool {
         &self.overrides
     }
 
-    pub fn excludes(&self) -> &[PackageName] {
+    pub fn excludes(&self) -> &[ExcludeDependency] {
         &self.excludes
     }
 
-    pub fn build_constraints(&self) -> &[Requirement] {
+    pub fn build_constraints(&self) -> &[NameRequirementSpecification] {
         &self.build_constraints
     }
 

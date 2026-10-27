@@ -1,7 +1,7 @@
 """Update the Python version constants in the test common module.
 
 This script reads the download-metadata.json file and extracts the latest
-patch version for each minor version (3.15, 3.14, 3.13, 3.12, 3.11, 3.10).
+patch version for each minor version (3.16, 3.15, 3.14, 3.13, 3.12, 3.11, 3.10).
 It then updates the LATEST_PYTHON_X_Y constants in crates/uv-test/src/lib.rs.
 
 For minor versions with stable releases, it uses the latest stable version.
@@ -14,6 +14,9 @@ in sync with the latest available Python versions.
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["packaging"]
+# [tool.uv]
+# no-build = true
+# exclude-newer = "P7D"
 # ///
 
 from __future__ import annotations
@@ -26,12 +29,12 @@ from packaging.version import Version
 
 SELF_DIR = Path(__file__).parent
 ROOT = SELF_DIR.parent
-PYTHON_MINOR_VERSIONS = ("3.15", "3.14", "3.13", "3.12", "3.11", "3.10")
+PYTHON_MINOR_VERSIONS = ("3.16", "3.15", "3.14", "3.13", "3.12", "3.11", "3.10")
 
 
 def main() -> None:
     # Read the download metadata
-    metadata_path = ROOT / "crates" / "uv-python" / "download-metadata.json"
+    metadata_path = ROOT / "crates" / "uv-python-managed" / "download-metadata.json"
     with open(metadata_path) as f:
         metadata = json.load(f)
 
@@ -65,11 +68,11 @@ def main() -> None:
 
     # Use stable if available, otherwise prerelease
     latest_versions: dict[str, str] = {}
-    for minor in stable_versions:
-        latest_versions[minor] = stable_versions[minor]
-    for minor in prerelease_versions:
+    for minor, version in stable_versions.items():
+        latest_versions[minor] = version
+    for minor, version in prerelease_versions.items():
         if minor not in latest_versions:
-            latest_versions[minor] = prerelease_versions[minor]
+            latest_versions[minor] = version
 
     # Update the constants in uv-test/src/lib.rs
     lib_path = ROOT / "crates" / "uv-test" / "src" / "lib.rs"

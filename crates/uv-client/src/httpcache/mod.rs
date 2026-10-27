@@ -137,7 +137,9 @@ actually need to make an HTTP request).
 
 use std::time::{Duration, SystemTime};
 
+use bitflags::bitflags;
 use http::header::HeaderValue;
+use rkyv::primitive::ArchivedU64;
 
 use crate::rkyvutil::OwnedArchive;
 
@@ -276,6 +278,17 @@ impl CachePolicy {
 }
 
 impl ArchivedCachePolicy {
+    /// Returns whether this cached response matches a request that permits stale data.
+    ///
+    /// This applies only the conditions from [`Self::before_request`] that produce
+    /// [`BeforeRequest::NoMatch`]. It intentionally skips freshness, `Vary`, and `no-cache`
+    /// checks because those produce [`BeforeRequest::Stale`], which an allow-stale caller accepts.
+    pub(crate) fn matches_stale_request(&self, request: &reqwest::Request) -> bool {
+        self.is_storable()
+            && self.request.uri == request.url().as_str()
+            && (request.method() == http::Method::GET || request.method() == http::Method::HEAD)
+    }
+
     /// Determines what caching behavior is correct given an existing
     /// `CachePolicy` and a new HTTP request for the resource managed by this
     /// cache policy. This is done as per [RFC 9111 S4].
@@ -307,7 +320,7 @@ impl ArchivedCachePolicy {
         // completely.
         if !self.is_storable() {
             tracing::trace!(
-                "Request {} does not match cache request {} because it isn't storable",
+                "Request `{}` does not match cache request `{}` because it isn't storable",
                 request.url(),
                 self.request.uri,
             );
@@ -320,7 +333,7 @@ impl ArchivedCachePolicy {
         // and..."
         if self.request.uri != request.url().as_str() {
             tracing::trace!(
-                "Request {} does not match cache URL of {}",
+                "Request `{}` does not match cache URL of `{}`",
                 request.url(),
                 self.request.uri,
             );
@@ -330,8 +343,8 @@ impl ArchivedCachePolicy {
         // be used for the presented request, and..."
         if request.method() != http::Method::GET && request.method() != http::Method::HEAD {
             tracing::trace!(
-                "Method {:?} for request {} is not supported by this cache",
-                request.method(),
+                "Method {} for request `{}` is not supported by this cache",
+                request.method().as_str(),
                 request.url(),
             );
             return BeforeRequest::NoMatch;
@@ -343,7 +356,7 @@ impl ArchivedCachePolicy {
         // conservatively require revalidation.
         if !self.vary.matches(request.headers()) {
             tracing::trace!(
-                "Request {} does not match cached request because of the 'Vary' header",
+                "Request `{}` does not match cached request because of the 'Vary' header",
                 request.url(),
             );
             self.set_revalidation_headers(request);
@@ -351,7 +364,7 @@ impl ArchivedCachePolicy {
         }
         // "the stored response does not contain the no-cache directive, unless
         // it is successfully validated, and..."
-        if self.response.headers.cc.no_cache {
+        if self.response.headers.cc.no_cache() {
             self.set_revalidation_headers(request);
             return BeforeRequest::Stale(self.new_cache_policy_builder(request));
         }
@@ -442,21 +455,20 @@ impl ArchivedCachePolicy {
         // we check `Last-Modified`.
         //
         // [RFC 9111 S4.3.4]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.4
-        if let Some(old_last_modified) = self.response.headers.last_modified_unix_timestamp.as_ref()
+        let old_last_modified = self.response.headers.timing.last_modified_unix_timestamp();
+        let new_last_modified = new_policy
+            .response
+            .headers
+            .timing
+            .last_modified_unix_timestamp();
+        if let (Some(old_last_modified), Some(new_last_modified)) =
+            (old_last_modified, new_last_modified)
+            && old_last_modified == new_last_modified
         {
-            if let Some(new_last_modified) = new_policy
-                .response
-                .headers
-                .last_modified_unix_timestamp
-                .as_ref()
-            {
-                if old_last_modified == new_last_modified {
-                    tracing::trace!(
-                        "Resource is not modified because modified times ({new_last_modified:?}) match",
-                    );
-                    return false;
-                }
-            }
+            tracing::trace!(
+                "Resource is not modified because modified times ({new_last_modified:?}) match",
+            );
+            return false;
         }
         // As per [RFC 9111 S4.3.4], if we have no validators anywhere, then
         // we can just rely on the HTTP 304 status code and reuse the cached
@@ -465,12 +477,8 @@ impl ArchivedCachePolicy {
         // [RFC 9111 S4.3.4]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.4
         if self.response.headers.etag.is_none()
             && new_policy.response.headers.etag.is_none()
-            && self.response.headers.last_modified_unix_timestamp.is_none()
-            && new_policy
-                .response
-                .headers
-                .last_modified_unix_timestamp
-                .is_none()
+            && old_last_modified.is_none()
+            && new_last_modified.is_none()
         {
             tracing::trace!(
                 "Resource is not modified because there are no etags or last modified \
@@ -524,18 +532,14 @@ impl ArchivedCachePolicy {
         //
         // [RFC 9110 S13.1.3]: https://www.rfc-editor.org/rfc/rfc9110#section-13.1.3
         // [RFC 9111 S4.3.1]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.1
-        if !request.headers().contains_key("if-modified-since") {
-            if let Some(&last_modified_unix_timestamp) =
-                self.response.headers.last_modified_unix_timestamp.as_ref()
-            {
-                if let Some(last_modified) =
-                    unix_timestamp_to_header(last_modified_unix_timestamp.into())
-                {
-                    request
-                        .headers_mut()
-                        .insert("if-modified-since", last_modified);
-                }
-            }
+        if !request.headers().contains_key("if-modified-since")
+            && let Some(last_modified_unix_timestamp) =
+                self.response.headers.timing.last_modified_unix_timestamp()
+            && let Some(last_modified) = unix_timestamp_to_header(last_modified_unix_timestamp)
+        {
+            request
+                .headers_mut()
+                .insert("if-modified-since", last_modified);
         }
     }
 
@@ -603,7 +607,7 @@ impl ArchivedCachePolicy {
         //
         // (This is from RFC 9111 S5.2.1.5, and doesn't seem to be mentioned in
         // S3.)
-        if self.request.headers.cc.no_store {
+        if self.request.headers.cc.no_store() {
             tracing::trace!(
                 "Response from {} is not storable because its request has \
                  a 'no-store' cache-control directive",
@@ -612,7 +616,7 @@ impl ArchivedCachePolicy {
             return false;
         }
         // "the no-store cache directive is not present in the response"
-        if self.response.headers.cc.no_store {
+        if self.response.headers.cc.no_store() {
             tracing::trace!(
                 "Response from {} is not storable because it has \
                  a 'no-store' cache-control directive",
@@ -629,7 +633,7 @@ impl ArchivedCachePolicy {
             // caching all of a private HTTP response in a shared cache only after
             // removing some subset of the response's headers that are deemed
             // private).
-            if self.response.headers.cc.private {
+            if self.response.headers.cc.private() {
                 tracing::trace!(
                     "Response from {} is not storable because this is a shared \
                      cache and has a 'private' cache-control directive",
@@ -655,7 +659,7 @@ impl ArchivedCachePolicy {
         // "the response contains at least one of the following ..."
         //
         // "a public response directive"
-        if self.response.headers.cc.public {
+        if self.response.headers.cc.public() {
             tracing::trace!(
                 "Response from {} is storable because it has \
                  a 'public' cache-control directive",
@@ -664,7 +668,7 @@ impl ArchivedCachePolicy {
             return true;
         }
         // "a private response directive, if the cache is not shared"
-        if !self.config.shared && self.response.headers.cc.private {
+        if !self.config.shared && self.response.headers.cc.private() {
             tracing::trace!(
                 "Response from {} is storable because this is a shared cache \
                  and has a 'private' cache-control directive",
@@ -673,7 +677,13 @@ impl ArchivedCachePolicy {
             return true;
         }
         // "an Expires header field"
-        if self.response.headers.expires_unix_timestamp.is_some() {
+        if self
+            .response
+            .headers
+            .timing
+            .expires_unix_timestamp()
+            .is_some()
+        {
             tracing::trace!(
                 "Response from {} is storable because it has an \
                  'Expires' header set",
@@ -682,7 +692,7 @@ impl ArchivedCachePolicy {
             return true;
         }
         // "a max-age response directive"
-        if self.response.headers.cc.max_age_seconds.is_some() {
+        if self.response.headers.cc.max_age_seconds().is_some() {
             tracing::trace!(
                 "Response from {} is storable because it has an \
                  'max-age' cache-control directive",
@@ -691,7 +701,7 @@ impl ArchivedCachePolicy {
             return true;
         }
         // "if the cache is shared: an s-maxage response directive"
-        if self.config.shared && self.response.headers.cc.s_maxage_seconds.is_some() {
+        if self.config.shared && self.response.headers.cc.s_maxage_seconds().is_some() {
             tracing::trace!(
                 "Response from {} is storable because this is a shared cache \
                  and has a 's-maxage' cache-control directive",
@@ -726,9 +736,9 @@ impl ArchivedCachePolicy {
     ///
     /// [RFC 9111 S3.5]: https://www.rfc-editor.org/rfc/rfc9111.html#section-3.5
     fn allows_authorization_storage(&self) -> bool {
-        self.response.headers.cc.must_revalidate
-            || self.response.headers.cc.public
-            || self.response.headers.cc.s_maxage_seconds.is_some()
+        self.response.headers.cc.must_revalidate()
+            || self.response.headers.cc.public()
+            || self.response.headers.cc.s_maxage_seconds().is_some()
     }
 
     /// Returns true if the response is considered fresh as per [RFC 9111
@@ -753,7 +763,7 @@ impl ArchivedCachePolicy {
         // request are ignored.
         //
         // [RFC 8246]: https://httpwg.org/specs/rfc8246.html
-        if !self.response.headers.cc.immutable {
+        if !self.response.headers.cc.immutable() {
             let reqcc = request
                 .headers()
                 .get_all("cache-control")
@@ -764,9 +774,9 @@ impl ArchivedCachePolicy {
             // respect that.
             //
             // [RFC 9111 S5.2.1.4]: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.1.4
-            if reqcc.no_cache {
+            if reqcc.no_cache() {
                 tracing::trace!(
-                    "Request to {} does not have a fresh cache entry because \
+                    "Request to `{}` does not have a fresh cache entry because \
                  it has a 'no-cache' cache-control directive",
                     request.url(),
                 );
@@ -777,10 +787,10 @@ impl ArchivedCachePolicy {
             // as per [RFC 9111 S5.2.1.1].
             //
             // [RFC 9111 S5.2.1.1]: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.1.1
-            if let Some(&max_age) = reqcc.max_age_seconds.as_ref() {
+            if let Some(max_age) = reqcc.max_age_seconds() {
                 if age > max_age {
                     tracing::trace!(
-                        "Request to {} does not have a fresh cache entry because \
+                        "Request to `{}` does not have a fresh cache entry because \
                      the cached response's age is {} seconds and the max age \
                      allowed by the request is {} seconds",
                         request.url(),
@@ -796,11 +806,11 @@ impl ArchivedCachePolicy {
             // the threshold provided, as per [RFC 9111 S5.2.1.3].
             //
             // [RFC 9111 S5.2.1.3]: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.1.3
-            if let Some(&min_fresh) = reqcc.min_fresh_seconds.as_ref() {
+            if let Some(min_fresh) = reqcc.min_fresh_seconds() {
                 let time_to_live = freshness_lifetime.saturating_sub(unix_timestamp(now));
                 if time_to_live < min_fresh {
                     tracing::trace!(
-                        "Request to {} does not have a fresh cache entry because \
+                        "Request to `{}` does not have a fresh cache entry because \
                      the request set a 'min-fresh' cache-control directive, \
                      and its time-to-live is {} seconds but it needs to be \
                      at least {} seconds",
@@ -814,14 +824,18 @@ impl ArchivedCachePolicy {
                 }
             }
         }
-        if age > freshness_lifetime {
+        // RFC 9111 S4.2 defines freshness as
+        // `freshness_lifetime > current_age`, so equality is stale.
+        //
+        // [RFC 9111 S4.2]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2
+        if age >= freshness_lifetime {
             let allows_stale = self.allows_stale(now);
             if !allows_stale {
                 tracing::trace!(
-                    "Request to {} does not have a fresh cache entry because \
-                     its age is {} seconds, it is greater than the freshness \
-                     lifetime of {} seconds and stale cached responses are not \
-                     allowed",
+                    "Request to `{}` does not have a fresh cache entry because \
+                     its age is {} seconds, it is greater than or equal to the \
+                     freshness lifetime of {} seconds and stale cached responses \
+                     are not allowed",
                     request.url(),
                     age,
                     freshness_lifetime,
@@ -844,7 +858,7 @@ impl ArchivedCachePolicy {
         // must-revalidate takes precedent.
         //
         // [RFC 9111 S5.2.2.2]: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.2
-        if self.response.headers.cc.must_revalidate {
+        if self.response.headers.cc.must_revalidate() {
             tracing::trace!(
                 "Request to {} has a cached response that does not \
                  permit staleness because the response has a 'must-revalidate' \
@@ -853,7 +867,7 @@ impl ArchivedCachePolicy {
             );
             return false;
         }
-        if let Some(&max_stale) = self.request.headers.cc.max_stale_seconds.as_ref() {
+        if let Some(max_stale) = self.request.headers.cc.max_stale_seconds() {
             // As per [RFC 9111 S5.2.1.2], if the client has max-stale set,
             // then stale responses are allowed, but only if they are stale
             // within a given threshold.
@@ -863,7 +877,7 @@ impl ArchivedCachePolicy {
                 .age(now)
                 .as_secs()
                 .saturating_sub(self.freshness_lifetime().as_secs());
-            if stale_amount <= max_stale.into() {
+            if stale_amount <= max_stale {
                 tracing::trace!(
                     "Request to {} has a cached response that allows staleness \
                      in this case because the stale amount is {} seconds and the \
@@ -908,7 +922,7 @@ impl ArchivedCachePolicy {
         let corrected_age_value = self.response.header_age().saturating_add(response_delay);
         let corrected_initial_age = apparent_age.max(corrected_age_value);
         let resident_age = unix_timestamp(now).saturating_sub(self.response.unix_timestamp.into());
-        let current_age = corrected_initial_age + resident_age;
+        let current_age = corrected_initial_age.saturating_add(resident_age);
         Duration::from_secs(current_age)
     }
 
@@ -923,8 +937,8 @@ impl ArchivedCachePolicy {
     /// [RFC 9111 S4.2.1]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2.1
     fn freshness_lifetime(&self) -> Duration {
         if self.config.shared {
-            if let Some(&s_maxage) = self.response.headers.cc.s_maxage_seconds.as_ref() {
-                let duration = Duration::from_secs(s_maxage.into());
+            if let Some(s_maxage) = self.response.headers.cc.s_maxage_seconds() {
+                let duration = Duration::from_secs(s_maxage);
                 tracing::trace!(
                     "Freshness lifetime found via shared \
                      cache-control max age setting: {duration:?}"
@@ -932,20 +946,25 @@ impl ArchivedCachePolicy {
                 return duration;
             }
         }
-        if let Some(&max_age) = self.response.headers.cc.max_age_seconds.as_ref() {
-            let duration = Duration::from_secs(max_age.into());
+        if let Some(max_age) = self.response.headers.cc.max_age_seconds() {
+            let duration = Duration::from_secs(max_age);
             tracing::trace!(
                 "Freshness lifetime found via cache-control max age setting: {duration:?}"
             );
             return duration;
         }
-        if let Some(&expires) = self.response.headers.expires_unix_timestamp.as_ref() {
-            let duration =
-                Duration::from_secs(u64::from(expires).saturating_sub(self.response.header_date()));
+        if let Some(expires) = self.response.headers.timing.expires_unix_timestamp() {
+            let duration = Duration::from_secs(expires.saturating_sub(self.response.header_date()));
             tracing::trace!("Freshness lifetime found via expires header: {duration:?}");
             return duration;
         }
-        if self.response.headers.last_modified_unix_timestamp.is_some() {
+        if self
+            .response
+            .headers
+            .timing
+            .last_modified_unix_timestamp()
+            .is_some()
+        {
             // We previously computed this heuristic freshness lifetime by
             // looking at the difference between the last modified header and
             // the response's date header. We then asserted that the cached
@@ -992,7 +1011,6 @@ impl ArchivedCachePolicy {
 /// This dictates what the caller should do next by indicating whether the
 /// cached response is stale or not.
 #[derive(Debug)]
-#[expect(clippy::large_enum_variant)]
 pub(crate) enum BeforeRequest {
     /// The cached response is still fresh, and the caller may return the
     /// cached response without issuing an HTTP requests.
@@ -1106,11 +1124,7 @@ impl ArchivedResponse {
     ///
     /// [RFC 9111 S4.2.3]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2.3
     fn header_age(&self) -> u64 {
-        self.headers
-            .age_seconds
-            .as_ref()
-            .map(u64::from)
-            .unwrap_or(0)
+        self.headers.timing.age_seconds().unwrap_or(0)
     }
 
     /// Returns the "date" header value on this response, with a fallback to
@@ -1119,9 +1133,9 @@ impl ArchivedResponse {
     /// [RFC 9110 S6.6.1]: https://www.rfc-editor.org/rfc/rfc9110#section-6.6.1
     fn header_date(&self) -> u64 {
         self.headers
-            .date_unix_timestamp
-            .unwrap_or(self.unix_timestamp)
-            .into()
+            .timing
+            .date_unix_timestamp()
+            .unwrap_or(self.unix_timestamp.into())
     }
 
     /// Returns true when this response has a status code that is considered
@@ -1148,12 +1162,84 @@ impl<'a> From<&'a reqwest::Response> for Response {
 struct ResponseHeaders {
     /// The directives from the `Cache-Control` header.
     cc: CacheControl,
+    /// The optional age and timestamp headers.
+    timing: ResponseTiming,
+    /// The "entity tag" from the response as per [RFC 9110 S8.8.3], which is
+    /// used in revalidation requests.
+    ///
+    /// [RFC 9110 S8.8.3]: https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3
+    etag: Option<ETag>,
+}
+
+/// Numeric response headers with a shared presence mask instead of four `Option` tags.
+#[derive(
+    Debug, rkyv::Archive, rkyv::Deserialize, rkyv::Portable, rkyv::Serialize, bytecheck::CheckBytes,
+)]
+#[rkyv(as = Self)]
+#[repr(C)]
+struct ResponseTiming {
+    age_seconds: ArchivedU64,
+    date_unix_timestamp: ArchivedU64,
+    expires_unix_timestamp: ArchivedU64,
+    last_modified_unix_timestamp: ArchivedU64,
+    presence: u8,
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    struct ResponseTimingFlags: u8 {
+        const AGE_SECONDS = 1 << 0;
+        const DATE_UNIX_TIMESTAMP = 1 << 1;
+        const EXPIRES_UNIX_TIMESTAMP = 1 << 2;
+        const LAST_MODIFIED_UNIX_TIMESTAMP = 1 << 3;
+    }
+}
+
+impl ResponseTiming {
+    fn new(
+        age_seconds: Option<u64>,
+        date_unix_timestamp: Option<u64>,
+        expires_unix_timestamp: Option<u64>,
+        last_modified_unix_timestamp: Option<u64>,
+    ) -> Self {
+        let mut presence = ResponseTimingFlags::empty();
+        presence.set(ResponseTimingFlags::AGE_SECONDS, age_seconds.is_some());
+        presence.set(
+            ResponseTimingFlags::DATE_UNIX_TIMESTAMP,
+            date_unix_timestamp.is_some(),
+        );
+        presence.set(
+            ResponseTimingFlags::EXPIRES_UNIX_TIMESTAMP,
+            expires_unix_timestamp.is_some(),
+        );
+        presence.set(
+            ResponseTimingFlags::LAST_MODIFIED_UNIX_TIMESTAMP,
+            last_modified_unix_timestamp.is_some(),
+        );
+        Self {
+            age_seconds: age_seconds.unwrap_or_default().into(),
+            date_unix_timestamp: date_unix_timestamp.unwrap_or_default().into(),
+            expires_unix_timestamp: expires_unix_timestamp.unwrap_or_default().into(),
+            last_modified_unix_timestamp: last_modified_unix_timestamp.unwrap_or_default().into(),
+            presence: presence.bits(),
+        }
+    }
+
+    fn presence(&self) -> ResponseTimingFlags {
+        ResponseTimingFlags::from_bits_retain(self.presence)
+    }
+
     /// The value of the `Age` header corresponding to `age_value` as defined
     /// in [RFC 9111 S4.2.3]. If the `Age` header is not present, it should be
     /// interpreted at `0`.
     ///
     /// [RFC 9111 S4.2.3]: https://www.rfc-editor.org/rfc/rfc9111.html#name-calculating-age
-    age_seconds: Option<u64>,
+    fn age_seconds(&self) -> Option<u64> {
+        self.presence()
+            .contains(ResponseTimingFlags::AGE_SECONDS)
+            .then_some(self.age_seconds.to_native())
+    }
+
     /// This is `date_value` from [RFC 9111 S4.2.3], which says it corresponds
     /// to the `Date` header on a response as defined in [RFC 7231 S7.1.1.2].
     /// In RFC 7231, if the `Date` header is not present, then the recipient
@@ -1162,7 +1248,12 @@ struct ResponseHeaders {
     ///
     /// [RFC 9111 S4.2.3]: https://www.rfc-editor.org/rfc/rfc9111.html#name-calculating-age
     /// [RFC 7231 S7.1.1.2]: https://httpwg.org/specs/rfc7231.html#header.date
-    date_unix_timestamp: Option<u64>,
+    fn date_unix_timestamp(&self) -> Option<u64> {
+        self.presence()
+            .contains(ResponseTimingFlags::DATE_UNIX_TIMESTAMP)
+            .then_some(self.date_unix_timestamp.to_native())
+    }
+
     /// This is from the `Expires` header as per [RFC 9111 S5.3]. Note that this
     /// is overridden by the presence of either the `max-age` or `s-maxage` cache
     /// control directives.
@@ -1172,40 +1263,42 @@ struct ResponseHeaders {
     /// past, which implies the response has already expired.)
     ///
     /// [RFC 9111 S5.3]: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.3
-    expires_unix_timestamp: Option<u64>,
+    fn expires_unix_timestamp(&self) -> Option<u64> {
+        self.presence()
+            .contains(ResponseTimingFlags::EXPIRES_UNIX_TIMESTAMP)
+            .then_some(self.expires_unix_timestamp.to_native())
+    }
+
     /// The date from the `Last-Modified` header as specified in [RFC 9110 S8.8.2]
     /// in RFC 2822 format. It's used to compute a heuristic freshness lifetime for
     /// the response when other indicators are missing as per [RFC 9111 S4.2.2].
     ///
     /// [RFC 9110 S8.8.2]: https://www.rfc-editor.org/rfc/rfc9110#section-8.8.2
     /// [RFC 9111 S4.2.2]: https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2.2
-    last_modified_unix_timestamp: Option<u64>,
-    /// The "entity tag" from the response as per [RFC 9110 S8.8.3], which is
-    /// used in revalidation requests.
-    ///
-    /// [RFC 9110 S8.8.3]: https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3
-    etag: Option<ETag>,
+    fn last_modified_unix_timestamp(&self) -> Option<u64> {
+        self.presence()
+            .contains(ResponseTimingFlags::LAST_MODIFIED_UNIX_TIMESTAMP)
+            .then_some(self.last_modified_unix_timestamp.to_native())
+    }
 }
 
 impl<'a> From<&'a http::HeaderMap> for ResponseHeaders {
     fn from(from: &'a http::HeaderMap) -> Self {
         Self {
             cc: from.get_all("cache-control").iter().collect(),
-            age_seconds: from
-                .get("age")
-                .and_then(|header| parse_seconds(header.as_bytes())),
-            date_unix_timestamp: from
-                .get("date")
-                .and_then(|header| header.to_str().ok())
-                .and_then(rfc2822_to_unix_timestamp),
-            expires_unix_timestamp: from
-                .get("expires")
-                .and_then(|header| header.to_str().ok())
-                .and_then(rfc2822_to_unix_timestamp),
-            last_modified_unix_timestamp: from
-                .get("last-modified")
-                .and_then(|header| header.to_str().ok())
-                .and_then(rfc2822_to_unix_timestamp),
+            timing: ResponseTiming::new(
+                from.get("age")
+                    .and_then(|header| parse_seconds(header.as_bytes())),
+                from.get("date")
+                    .and_then(|header| header.to_str().ok())
+                    .and_then(rfc2822_to_unix_timestamp),
+                from.get("expires")
+                    .and_then(|header| header.to_str().ok())
+                    .and_then(rfc2822_to_unix_timestamp),
+                from.get("last-modified")
+                    .and_then(|header| header.to_str().ok())
+                    .and_then(rfc2822_to_unix_timestamp),
+            ),
             etag: from
                 .get("etag")
                 .map(|header| ETag::parse(header.as_bytes())),
@@ -1397,4 +1490,131 @@ fn parse_seconds(value: &[u8]) -> Option<u64> {
         return None;
     }
     std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn http_request(method: http::Method, uri: &str) -> reqwest::Request {
+        reqwest::Request::new(method, uri.parse().unwrap())
+    }
+
+    fn archived_cache_policy(
+        request: &reqwest::Request,
+        response: http::response::Builder,
+    ) -> OwnedArchive<CachePolicy> {
+        let response = reqwest::Response::from(response.body(Vec::new()).unwrap());
+        CachePolicyBuilder::new(request)
+            .build(&response)
+            .to_archived()
+    }
+
+    #[test]
+    fn archived_response_timing_preserves_optional_values() {
+        let mut values = [None, Some(0), Some(42), Some(u64::MAX)];
+        for _ in 0..values.len() {
+            let timing = ResponseTiming::new(values[0], values[1], values[2], values[3]);
+            let bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&timing).expect("archive response timing");
+            let archived =
+                OwnedArchive::<ResponseTiming>::new(bytes).expect("validate response timing");
+            assert_eq!(
+                [
+                    archived.age_seconds(),
+                    archived.date_unix_timestamp(),
+                    archived.expires_unix_timestamp(),
+                    archived.last_modified_unix_timestamp(),
+                ],
+                values,
+            );
+            values.rotate_left(1);
+        }
+    }
+
+    /// A server or proxy is free to send an arbitrarily large `Age` header, up
+    /// to `u64::MAX`. Combined with the resident age of a cached response, the
+    /// RFC 9111 S4.2.3 age computation must not overflow. Every term uses
+    /// saturating arithmetic, so the age saturates to `Duration::from_secs`
+    /// `(u64::MAX)` and the response is treated as stale rather than panicking
+    /// (debug) or wrapping around to a bogus "fresh" age (release). This must
+    /// remain stale even if the response's freshness lifetime also reaches
+    /// `u64::MAX`.
+    #[test]
+    fn age_saturates_on_huge_age_header() {
+        let request =
+            reqwest::Request::new(http::Method::GET, "https://example.com/".parse().unwrap());
+        let http_response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::AGE, u64::MAX.to_string())
+            .header(http::header::CACHE_CONTROL, format!("max-age={}", u64::MAX))
+            .body(Vec::new())
+            .unwrap();
+        let response = reqwest::Response::from(http_response);
+
+        let policy = CachePolicyBuilder::new(&request).build(&response);
+        let archived = policy.to_archived();
+
+        // `now` must be strictly after the response timestamp so that
+        // `resident_age` is non-zero, which is the term that triggers the
+        // overflow when added to a `u64::MAX`-derived initial age.
+        let now = SystemTime::now() + Duration::from_secs(5);
+        assert_eq!(archived.age(now), Duration::from_secs(u64::MAX));
+        assert!(!archived.is_fresh(now, &request));
+    }
+
+    #[test]
+    fn stale_request_ignores_freshness_and_vary() {
+        let mut original = http_request(http::Method::GET, "https://example.com/");
+        original
+            .headers_mut()
+            .insert(http::header::ACCEPT, "application/json".parse().unwrap());
+        let archived = archived_cache_policy(
+            &original,
+            http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CACHE_CONTROL, "no-cache")
+                .header(http::header::VARY, "accept"),
+        );
+
+        let mut request = http_request(http::Method::GET, "https://example.com/");
+        request
+            .headers_mut()
+            .insert(http::header::ACCEPT, "text/html".parse().unwrap());
+
+        assert!(archived.matches_stale_request(&request));
+        assert_matches!(
+            archived.before_request(&mut request),
+            BeforeRequest::Stale(_)
+        );
+
+        let request = http_request(http::Method::HEAD, "https://example.com/");
+        assert!(archived.matches_stale_request(&request));
+    }
+
+    #[test]
+    fn stale_request_rejects_non_matching_cache_entries() {
+        let original = http_request(http::Method::GET, "https://example.com/");
+        let archived = archived_cache_policy(
+            &original,
+            http::Response::builder().status(http::StatusCode::OK),
+        );
+
+        let different_uri = http_request(http::Method::GET, "https://example.com/other");
+        assert!(!archived.matches_stale_request(&different_uri));
+
+        let unsupported_method = http_request(http::Method::POST, "https://example.com/");
+        assert!(!archived.matches_stale_request(&unsupported_method));
+
+        let unstorable = archived_cache_policy(
+            &original,
+            http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CACHE_CONTROL, "no-store"),
+        );
+        assert!(!unstorable.matches_stale_request(&original));
+    }
 }

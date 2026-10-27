@@ -1,3 +1,4 @@
+use anyhow::Result;
 use assert_cmd::assert::OutputAssertExt;
 use assert_fs::prelude::*;
 use indoc::{formatdoc, indoc};
@@ -5,10 +6,102 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use uv_static::EnvVars;
+use uv_test::packse::PackseServer;
 use uv_test::uv_snapshot;
 
-fn write_audit_json_project(context: &uv_test::TestContext, index_url: &str) {
-    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+#[test]
+fn audit_offline() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.audit().arg("--offline"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Auditing requires network access and cannot be performed in offline mode
+    ");
+
+    uv_snapshot!(context.filters(), context.audit().env(EnvVars::UV_OFFLINE, "1"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Auditing requires network access and cannot be performed in offline mode
+    ");
+
+    context.temp_dir.child("uv.toml").write_str(indoc! {"
+        offline = true
+    "})?;
+
+    uv_snapshot!(context.filters(), context.audit(), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Auditing requires network access and cannot be performed in offline mode
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn audit_invalid_service_url() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--service-url")
+        .arg("not-a-url"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: invalid value 'not-a-url' for '--service-url <SERVICE_URL>': relative URL without a base
+
+    For more information, try '--help'.
+    ");
+}
+
+/// The workspace discovered while resolving settings is reused by `uv audit`.
+#[test]
+fn audit_reuses_settings_workspace_discovery() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "root"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+
+            [tool.uv.workspace]
+            members = ["member"]
+        "#})?;
+    let member = context.temp_dir.child("member");
+    member.create_dir_all()?;
+    member.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "member"
+        version = "0.1.0"
+    "#})?;
+
+    context.lock().assert().success();
+
+    uv_snapshot!(context.filters(), context.audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .env(EnvVars::RUST_LOG, "uv_workspace=trace"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    DEBUG Found workspace root: [TEMP_DIR]/
+    TRACE Discovering workspace members for: [TEMP_DIR]/
+    DEBUG Adding root workspace member: [TEMP_DIR]/
+    TRACE Processing workspace member: member
+    DEBUG Adding discovered workspace member: [TEMP_DIR]/member
+    Resolved 2 packages in [TIME]
+    Found no known vulnerabilities and no adverse project statuses in 0 packages
+    ");
+
+    Ok(())
+}
+
+fn write_audit_output_project(project_dir: &impl PathChild, index_url: &str) {
+    let pyproject_toml = project_dir.child("pyproject.toml");
     pyproject_toml
         .write_str(&formatdoc! {r#"
         [project]
@@ -23,7 +116,7 @@ fn write_audit_json_project(context: &uv_test::TestContext, index_url: &str) {
     "#})
         .unwrap();
 
-    let lockfile = context.temp_dir.child("uv.lock");
+    let lockfile = project_dir.child("uv.lock");
     lockfile
         .write_str(&formatdoc! {r#"
         version = 1
@@ -92,10 +185,7 @@ async fn audit_no_vulnerabilities() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -107,7 +197,7 @@ async fn audit_no_vulnerabilities() {
 async fn audit_json_no_vulnerabilities() {
     let context = uv_test::test_context!("3.12");
     let proxy = crate::pypi_proxy::start().await;
-    write_audit_json_project(&context, &proxy.url("/simple"));
+    write_audit_output_project(&context.temp_dir, &proxy.url("/simple"));
 
     let server = MockServer::start().await;
 
@@ -128,8 +218,7 @@ async fn audit_json_no_vulnerabilities() {
         .arg("--frozen")
         .arg("--service-url")
         .arg(server.uri()), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     {
       "schema": {
@@ -143,8 +232,6 @@ async fn audit_json_no_vulnerabilities() {
       "vulnerabilities": [],
       "adverse_statuses": []
     }
-
-    ----- stderr -----
     "#);
 }
 
@@ -153,7 +240,7 @@ async fn audit_json_no_vulnerabilities() {
 async fn audit_json_preview_warning() {
     let context = uv_test::test_context!("3.12");
     let proxy = crate::pypi_proxy::start().await;
-    write_audit_json_project(&context, &proxy.url("/simple"));
+    write_audit_output_project(&context.temp_dir, &proxy.url("/simple"));
 
     let server = MockServer::start().await;
 
@@ -174,8 +261,7 @@ async fn audit_json_preview_warning() {
         .arg("--frozen")
         .arg("--service-url")
         .arg(server.uri()), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     {
       "schema": {
@@ -230,6 +316,10 @@ async fn audit_vulnerability_found() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -252,8 +342,7 @@ async fn audit_vulnerability_found() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -276,7 +365,7 @@ async fn audit_vulnerability_found() {
 /// Audit a project when OSV returns a malformed vulnerability record.
 #[tokio::test]
 async fn audit_malformed_vulnerability_record() {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context!("3.12").with_filtered_http_retries();
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml
@@ -331,15 +420,12 @@ async fn audit_malformed_vulnerability_record() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     error: OSV returned a malformed vulnerability record for `PYSEC-2023-0001`
-      Caused by: error decoding response body for url (http://[LOCALHOST]/v1/vulns/PYSEC-2023-0001)
-      Caused by: expected value at line 1 column 56
+      cause: error decoding response body for url (http://[LOCALHOST]/v1/vulns/PYSEC-2023-0001)
+      cause: expected value at line 1 column 56
     ");
 }
 
@@ -371,10 +457,7 @@ async fn audit_no_dependencies() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 1 package in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 0 packages
@@ -401,22 +484,22 @@ async fn audit_best_id_selection() {
 
     let server = MockServer::start().await;
 
-    // The primary ID is an OSV ID, but aliases include a PYSEC ID which should be preferred.
+    // Prefer the PYSEC alias over both the primary CVE ID and the earlier GHSA alias.
     Mock::given(method("POST"))
         .and(path("/v1/querybatch"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": [{"vulns": [{"id": "OSV-2023-0001"}]}]
+            "results": [{"vulns": [{"id": "CVE-2023-9999"}]}]
         })))
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v1/vulns/OSV-2023-0001"))
+        .and(path("/v1/vulns/CVE-2023-9999"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "OSV-2023-0001",
+            "id": "CVE-2023-9999",
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A vulnerability with many aliases",
-            "aliases": ["PYSEC-2023-0042", "CVE-2023-9999", "GHSA-xxxx-yyyy-zzzz"]
+            "aliases": ["GHSA-xxxx-yyyy-zzzz", "PYSEC-2023-0042"]
         })))
         .mount(&server)
         .await;
@@ -428,8 +511,7 @@ async fn audit_best_id_selection() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -440,7 +522,7 @@ async fn audit_best_id_selection() {
 
       No fix versions available
 
-      Advisory information: https://osv.dev/vulnerability/OSV-2023-0001
+      Advisory information: https://osv.dev/vulnerability/CVE-2023-9999
 
 
     ----- stderr -----
@@ -493,8 +575,7 @@ async fn audit_no_fix_versions() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -549,6 +630,10 @@ async fn audit_multiple_vulnerabilities_same_package() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "First vulnerability",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -572,6 +657,10 @@ async fn audit_multiple_vulnerabilities_same_package() {
             "modified": "2026-01-02T00:00:00Z",
             "summary": "Second vulnerability",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -594,8 +683,7 @@ async fn audit_multiple_vulnerabilities_same_package() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -660,10 +748,7 @@ async fn audit_no_dev() {
         .arg("--no-dev")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 3 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -676,10 +761,7 @@ async fn audit_no_dev() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 3 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -724,10 +806,7 @@ async fn audit_extras() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 3 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -742,17 +821,14 @@ async fn audit_extras() {
         .arg("web")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 3 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
     ");
 }
 
-/// Non-default dependency groups are included when explicitly requested.
+/// Dependency group filters limit the groups included in an audit.
 #[tokio::test]
 async fn audit_dependency_groups() {
     let context = uv_test::test_context!("3.12");
@@ -792,10 +868,7 @@ async fn audit_dependency_groups() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 3 packages
@@ -809,10 +882,7 @@ async fn audit_dependency_groups() {
         .arg("--no-dev")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -827,10 +897,7 @@ async fn audit_dependency_groups() {
         .arg("lint")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -845,10 +912,70 @@ async fn audit_dependency_groups() {
         .arg("lint")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    Found no known vulnerabilities and no adverse project statuses in 1 package
+    ");
+}
 
+/// `--no-default-groups` disables all implicit dependency groups in an audit.
+#[tokio::test]
+async fn audit_no_default_groups() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+
+        [dependency-groups]
+        dev = ["typing-extensions==4.10.0"]
+        lint = ["sniffio==1.3.1"]
+
+        [tool.uv]
+        default-groups = ["dev"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": []}]
+        })))
+        .mount(&server)
+        .await;
+
+    // All groups are audited by default, including lint, which is not in default-groups.
+    uv_snapshot!(context.filters(), context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--service-url")
+        .arg(server.uri()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    Found no known vulnerabilities and no adverse project statuses in 3 packages
+    ");
+
+    // Disabling implicit groups leaves only the project's dependencies.
+    uv_snapshot!(context.filters(), context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--no-default-groups")
+        .arg("--service-url")
+        .arg(server.uri()), @"
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -890,6 +1017,10 @@ async fn audit_ignore_by_id() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -909,8 +1040,7 @@ async fn audit_ignore_by_id() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -938,10 +1068,7 @@ async fn audit_ignore_by_id() {
         .arg("PYSEC-2023-0001")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -996,10 +1123,7 @@ async fn audit_ignore_by_alias() {
         .arg("CVE-2023-9999")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -1054,10 +1178,7 @@ async fn audit_ignore_until_fixed() {
         .arg("VULN-NO-FIX")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -1100,6 +1221,10 @@ async fn audit_ignore_until_fixed_with_fix() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1121,8 +1246,7 @@ async fn audit_ignore_until_fixed_with_fix() {
         .arg("PYSEC-2023-0001")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -1139,6 +1263,101 @@ async fn audit_ignore_until_fixed_with_fix() {
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found 1 known vulnerability and no adverse project statuses in 1 package
+    ");
+}
+
+/// `--ignore-until-fixed` ignores fixes for other or missing packages in the same OSV record.
+#[tokio::test]
+async fn audit_ignore_until_fixed_with_fix_for_other_package() {
+    let index = PackseServer::new("simple/single-package.toml");
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["a==1.0.0"]
+    "#})
+        .unwrap();
+
+    context
+        .lock()
+        .arg("--index")
+        .arg(index.index_url())
+        .assert()
+        .success();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "PYSEC-2023-0001"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/PYSEC-2023-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "PYSEC-2023-0001",
+            "modified": "2026-01-01T00:00:00Z",
+            "summary": "A test vulnerability in multiple packages",
+            "affected": [
+                {
+                    "package": {
+                        "ecosystem": "PyPI",
+                        "name": "a"
+                    },
+                    "ranges": [{
+                        "type": "ECOSYSTEM",
+                        "events": [{"introduced": "0"}]
+                    }]
+                },
+                {
+                    "package": {
+                        "ecosystem": "PyPI",
+                        "name": "other-package"
+                    },
+                    "ranges": [{
+                        "type": "ECOSYSTEM",
+                        "events": [
+                            {"introduced": "0"},
+                            {"fixed": "2.1.0"}
+                        ]
+                    }]
+                },
+                {
+                    "ranges": [{
+                        "type": "ECOSYSTEM",
+                        "events": [
+                            {"introduced": "0"},
+                            {"fixed": "9.9.9"}
+                        ]
+                    }]
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--index")
+        .arg(index.index_url())
+        .arg("--ignore-until-fixed")
+        .arg("PYSEC-2023-0001")
+        .arg("--service-url")
+        .arg(server.uri()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Found no known vulnerabilities and no adverse project statuses in 1 package
     ");
 }
 
@@ -1180,6 +1399,10 @@ async fn audit_ignore_config() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1199,10 +1422,7 @@ async fn audit_ignore_config() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -1257,10 +1477,7 @@ async fn audit_ignore_until_fixed_config() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -1302,6 +1519,10 @@ async fn audit_ignore_partial() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "First vulnerability",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1321,6 +1542,10 @@ async fn audit_ignore_partial() {
             "modified": "2026-01-02T00:00:00Z",
             "summary": "Second vulnerability",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1342,8 +1567,7 @@ async fn audit_ignore_partial() {
         .arg("VULN-A")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -1400,10 +1624,7 @@ async fn audit_ignore_unmatched() {
         .arg("CVE-XXXX-YYYY")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     warning: Ignored vulnerability `CVE-XXXX-YYYY` does not match any vulnerability in the project
@@ -1448,10 +1669,7 @@ async fn audit_ignore_until_fixed_unmatched() {
         .arg("CVE-XXXX-YYYY")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     warning: Ignored vulnerability `CVE-XXXX-YYYY` does not match any vulnerability in the project
@@ -1494,6 +1712,10 @@ async fn audit_ignore_mixed_matched_unmatched() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1518,10 +1740,7 @@ async fn audit_ignore_mixed_matched_unmatched() {
         .arg("CVE-DOES-NOT-EXIST")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     warning: Ignored vulnerability `CVE-DOES-NOT-EXIST` does not match any vulnerability in the project
@@ -1589,10 +1808,7 @@ async fn audit_script_no_vulnerabilities() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 1 package in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -1658,6 +1874,10 @@ async fn audit_script_vulnerability_found() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -1682,8 +1902,7 @@ async fn audit_script_vulnerability_found() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -1744,10 +1963,7 @@ async fn audit_script_no_dependencies() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 0 packages
@@ -1784,10 +2000,7 @@ async fn audit_script_frozen_missing_lockfile() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 1 (failure)
     ----- stderr -----
     error: Unable to find lockfile at `script.py.lock`, but `--frozen` was provided. To create a lockfile, run `uv lock` or `uv sync` without the flag.
     ");
@@ -1866,10 +2079,7 @@ async fn audit_script_multiple_dependencies() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -1956,10 +2166,7 @@ async fn audit_script_extras() {
         .arg("script.py")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 2 packages
@@ -2005,8 +2212,7 @@ async fn audit_project_status_deprecated_with_reason() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @r"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
 
     Adverse statuses:
@@ -2057,8 +2263,7 @@ async fn audit_project_status_archived_no_reason() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @r"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
 
     Adverse statuses:
@@ -2109,8 +2314,7 @@ async fn audit_project_status_quarantined() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @r"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
 
     Adverse statuses:
@@ -2161,10 +2365,7 @@ async fn audit_project_status_active_not_reported() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-
+    exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
     Found no known vulnerabilities and no adverse project statuses in 1 package
@@ -2211,6 +2412,10 @@ async fn audit_vulnerability_and_project_status() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -2229,8 +2434,7 @@ async fn audit_vulnerability_and_project_status() {
         .arg("audit")
         .arg("--service-url")
         .arg(server.uri()), @r"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
 
     Vulnerabilities:
@@ -2260,7 +2464,7 @@ async fn audit_vulnerability_and_project_status() {
 async fn audit_json_vulnerability_and_project_status() {
     let context = uv_test::test_context!("3.12");
     let proxy = crate::pypi_proxy::start().await;
-    write_audit_json_project(&context, &proxy.url("/status/archived/simple"));
+    write_audit_output_project(&context.temp_dir, &proxy.url("/status/archived/simple"));
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2278,6 +2482,10 @@ async fn audit_json_vulnerability_and_project_status() {
             "modified": "2026-01-01T00:00:00Z",
             "summary": "A test vulnerability in iniconfig",
             "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
                 "ranges": [{
                     "type": "ECOSYSTEM",
                     "events": [
@@ -2303,8 +2511,7 @@ async fn audit_json_vulnerability_and_project_status() {
         .arg("--frozen")
         .arg("--service-url")
         .arg(server.uri()), @r#"
-    success: false
-    exit_code: 1
+    exit_code: 1 (failure)
     ----- stdout -----
     {
       "schema": {
@@ -2342,7 +2549,288 @@ async fn audit_json_vulnerability_and_project_status() {
         }
       ]
     }
-
-    ----- stderr -----
     "#);
+}
+
+/// SARIF output includes vulnerabilities and adverse project statuses in the
+/// same audit report.
+#[tokio::test]
+async fn audit_sarif_vulnerability_and_project_status() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filter((uv_version::version(), "[VERSION]"));
+    context.temp_dir.child(".git").create_dir_all()?;
+    let proxy = crate::pypi_proxy::start().await;
+    write_audit_output_project(&context.temp_dir, &proxy.url("/status/archived/simple"));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "OSV-2023-0001"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/OSV-2023-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "OSV-2023-0001",
+            "aliases": ["PYSEC-2023-0001"],
+            "modified": "2026-01-01T00:00:00Z",
+            "published": "2025-12-01T00:00:00Z",
+            "summary": "A test vulnerability in iniconfig",
+            "details": "A longer description of the test vulnerability.",
+            "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
+                "ranges": [{
+                    "type": "ECOSYSTEM",
+                    "events": [
+                        {"introduced": "0"},
+                        {"fixed": "2.1.0"}
+                    ]
+                }]
+            }],
+            "references": [{
+                "type": "ADVISORY",
+                "url": "https://example.com/advisory/PYSEC-2023-0001"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--output-format")
+        .arg("sarif")
+        .arg("--frozen")
+        .arg("--service-url")
+        .arg(server.uri()), @r#"
+    exit_code: 1 (failure)
+    ----- stdout -----
+    {
+      "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+      "runs": [
+        {
+          "invocations": [
+            {
+              "executionSuccessful": true
+            }
+          ],
+          "results": [
+            {
+              "kind": "fail",
+              "level": "error",
+              "locations": [
+                {
+                  "logicalLocations": [
+                    {
+                      "fullyQualifiedName": "iniconfig@2.0.0",
+                      "kind": "package",
+                      "name": "iniconfig"
+                    }
+                  ],
+                  "physicalLocation": {
+                    "artifactLocation": {
+                      "uri": "uv.lock"
+                    },
+                    "region": {
+                      "startLine": 1
+                    }
+                  }
+                }
+              ],
+              "message": {
+                "text": "iniconfig 2.0.0 is vulnerable to PYSEC-2023-0001: A test vulnerability in iniconfig"
+              },
+              "partialFingerprints": {
+                "uv/vulnerability": "OSV-2023-0001:iniconfig:2.0.0"
+              },
+              "properties": {
+                "uv/aliases": [
+                  "PYSEC-2023-0001"
+                ],
+                "uv/displayId": "PYSEC-2023-0001",
+                "uv/fixVersions": [
+                  "2.1.0"
+                ],
+                "uv/id": "OSV-2023-0001",
+                "uv/modified": "2026-01-01T00:00:00Z",
+                "uv/package": "iniconfig",
+                "uv/published": "2025-12-01T00:00:00Z",
+                "uv/version": "2.0.0"
+              },
+              "ruleId": "OSV-2023-0001"
+            },
+            {
+              "kind": "fail",
+              "level": "warning",
+              "locations": [
+                {
+                  "logicalLocations": [
+                    {
+                      "fullyQualifiedName": "iniconfig",
+                      "kind": "package",
+                      "name": "iniconfig"
+                    }
+                  ],
+                  "physicalLocation": {
+                    "artifactLocation": {
+                      "uri": "uv.lock"
+                    },
+                    "region": {
+                      "startLine": 1
+                    }
+                  }
+                }
+              ],
+              "message": {
+                "text": "iniconfig is archived"
+              },
+              "partialFingerprints": {
+                "uv/project-status": "iniconfig:archived"
+              },
+              "properties": {
+                "uv/package": "iniconfig",
+                "uv/status": "archived"
+              },
+              "ruleId": "uv/project-status/archived"
+            }
+          ],
+          "tool": {
+            "driver": {
+              "downloadUri": "https://github.com/astral-sh/uv",
+              "informationUri": "https://pypi.org/project/uv/",
+              "name": "uv",
+              "rules": [
+                {
+                  "help": {
+                    "text": "A longer description of the test vulnerability."
+                  },
+                  "helpUri": "https://example.com/advisory/PYSEC-2023-0001",
+                  "id": "OSV-2023-0001",
+                  "name": "PYSEC-2023-0001",
+                  "properties": {
+                    "tags": [
+                      "security",
+                      "vulnerability"
+                    ]
+                  }
+                },
+                {
+                  "help": {
+                    "text": "The project is archived and is no longer maintained."
+                  },
+                  "helpUri": "https://packaging.python.org/en/latest/specifications/project-status-markers/#archived",
+                  "id": "uv/project-status/archived",
+                  "name": "archived",
+                  "properties": {
+                    "tags": [
+                      "package",
+                      "project-status"
+                    ]
+                  }
+                }
+              ],
+              "semanticVersion": "[VERSION]",
+              "version": "[VERSION]"
+            }
+          }
+        }
+      ],
+      "version": "2.1.0"
+    }
+    "#);
+
+    Ok(())
+}
+
+/// SARIF artifact locations are relative to the repository root, whether the
+/// project is selected with `--project` or uv is invoked from the project directory.
+#[tokio::test]
+async fn audit_sarif_project_artifact_uri() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context.temp_dir.child(".git").create_dir_all()?;
+    let proxy = crate::pypi_proxy::start().await;
+    let project_dir = context.temp_dir.child("packages/project");
+    project_dir.create_dir_all()?;
+    write_audit_output_project(&project_dir, &proxy.url("/simple"));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "PYSEC-2023-0001"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/PYSEC-2023-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "PYSEC-2023-0001",
+            "modified": "2026-01-01T00:00:00Z",
+            "affected": [{
+                "package": {
+                    "ecosystem": "PyPI",
+                    "name": "iniconfig"
+                },
+                "ranges": [{
+                    "type": "ECOSYSTEM",
+                    "events": [{"introduced": "0"}]
+                }]
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let assert = context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--output-format")
+        .arg("sarif")
+        .arg("--frozen")
+        .arg("--project")
+        .arg(project_dir.path())
+        .arg("--service-url")
+        .arg(server.uri())
+        .assert()
+        .failure()
+        .code(1);
+    let project_report: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout)?;
+
+    let assert = context
+        .audit()
+        .arg("--preview-features")
+        .arg("audit")
+        .arg("--output-format")
+        .arg("sarif")
+        .arg("--frozen")
+        .arg("--service-url")
+        .arg(server.uri())
+        .current_dir(&project_dir)
+        .assert()
+        .failure()
+        .code(1);
+    let nested_report: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout)?;
+
+    let artifact_uris = [
+        project_report
+            .pointer("/runs/0/results/0/locations/0/physicalLocation/artifactLocation/uri"),
+        nested_report
+            .pointer("/runs/0/results/0/locations/0/physicalLocation/artifactLocation/uri"),
+    ];
+
+    insta::assert_json_snapshot!(artifact_uris, @r#"
+    [
+      "packages/project/uv.lock",
+      "packages/project/uv.lock"
+    ]
+    "#);
+
+    Ok(())
 }

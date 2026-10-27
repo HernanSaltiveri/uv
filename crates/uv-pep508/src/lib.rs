@@ -23,20 +23,24 @@ use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::str::FromStr;
 
+use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
+#[cfg(feature = "unsafe-url")]
+#[expect(clippy::disallowed_types, reason = "Supports the opt-in raw URL API")]
 use url::Url;
 
 use uv_cache_key::{CacheKey, CacheKeyHasher};
 use uv_normalize::{ExtraName, PackageName};
 
 use crate::cursor::Cursor;
+pub(crate) use crate::marker::MarkerValue;
 pub use crate::marker::{
     CanonicalMarkerValueExtra, CanonicalMarkerValueString, CanonicalMarkerValueVersion,
     ContainsMarkerTree, ExtraMarkerTree, ExtraOperator, InMarkerTree, MarkerEnvironment,
     MarkerEnvironmentBuilder, MarkerExpression, MarkerOperator, MarkerTree, MarkerTreeContents,
-    MarkerTreeKind, MarkerValue, MarkerValueExtra, MarkerValueList, MarkerValueString,
-    MarkerValueVersion, MarkerWarningKind, StringMarkerTree, StringVersion, VersionMarkerTree,
+    MarkerTreeKind, MarkerValueExtra, MarkerValueList, MarkerValueString, MarkerValueVersion,
+    MarkerWarningKind, StringMarkerTree, StringVersion, VersionMarkerTree,
 };
 pub use crate::origin::RequirementOrigin;
 #[cfg(feature = "non-pep508-extensions")]
@@ -86,6 +90,10 @@ pub enum Pep508ErrorSource<T: Pep508Url = VerbatimUrl> {
 impl<T: Pep508Url> Display for Pep508Error<T> {
     /// Pretty formatting with underline.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.input.is_empty() {
+            return Display::fmt(&self.message, f);
+        }
+
         // We can use char indices here since it's a Vec<char>
         let start_offset = self.input[..self.start]
             .chars()
@@ -167,32 +175,20 @@ fn fmt_requirement<T: Pep508Url + Display>(
 ) -> std::fmt::Result {
     write!(f, "{}", requirement.name)?;
     if !requirement.extras.is_empty() {
-        write!(
-            f,
-            "[{}]",
-            requirement
-                .extras
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        )?;
+        write!(f, "[{}]", requirement.extras.iter().format(","))?;
     }
     if let Some(version_or_url) = &requirement.version_or_url {
         match version_or_url {
             VersionOrUrl::VersionSpecifier(version_specifier) => {
-                let version_specifier: Vec<String> =
-                    version_specifier.iter().map(ToString::to_string).collect();
-                write!(f, "{}", version_specifier.join(","))?;
+                write!(f, "{}", version_specifier.iter().format(","))?;
             }
             VersionOrUrl::Url(url) => {
-                let url_string = if display_credentials {
-                    url.displayable_with_credentials().to_string()
-                } else {
-                    url.to_string()
-                };
                 // We add the space for markers later if necessary
-                write!(f, " @ {url_string}")?;
+                if display_credentials {
+                    write!(f, " @ {}", url.displayable_with_credentials())?;
+                } else {
+                    write!(f, " @ {url}")?;
+                }
             }
         }
     }
@@ -239,7 +235,7 @@ impl<T: Pep508Url> Serialize for Requirement<T> {
     }
 }
 
-impl<T: Pep508Url> CacheKey for Requirement<T> {
+impl<T: Pep508Url + CacheKey> CacheKey for Requirement<T> {
     fn cache_key(&self, state: &mut CacheKeyHasher) {
         self.name.as_str().cache_key(state);
 
@@ -293,11 +289,12 @@ impl<T: Pep508Url> Requirement<T> {
     /// For example, given `flask >= 2.0.2`, calling `with_extra_marker("dotenv")` would return
     /// `flask >= 2.0.2 ; extra == "dotenv"`.
     #[must_use]
-    pub fn with_extra_marker(mut self, extra: &ExtraName) -> Self {
-        self.marker
+    pub fn with_extra_marker(mut self, extra: ExtraName) -> Self {
+        self.marker = self
+            .marker
             .and(MarkerTree::expression(MarkerExpression::Extra {
                 operator: ExtraOperator::Equal,
-                name: MarkerValueExtra::Extra(extra.clone()),
+                name: MarkerValueExtra::Extra(extra),
             }));
 
         self
@@ -313,18 +310,37 @@ impl<T: Pep508Url> Requirement<T> {
     }
 }
 
-/// Type to parse URLs from `name @ <url>` into. Defaults to [`Url`].
-pub trait Pep508Url: Display + Debug + Sized + CacheKey {
+/// The URL type parsed from `name @ <url>`.
+///
+/// [`Requirement`] uses [`VerbatimUrl`] by default. The implementation for [`url::Url`]
+/// requires the `unsafe-url` feature.
+///
+/// Requirements implement [`CacheKey`] only when their URL type does.
+#[cfg_attr(
+    not(feature = "unsafe-url"),
+    doc = r#"
+Without `unsafe-url`, requirements cannot use [`url::Url`]:
+
+```compile_fail
+use uv_pep508::Requirement;
+
+let _: Requirement<url::Url> = "demo @ https://example.com/demo.whl".parse().unwrap();
+```
+"#
+)]
+pub trait Pep508Url: Display + Debug + Sized {
     /// String to URL parsing error
     type Err: Error + Debug;
 
-    /// Parse a url from `name @ <url>`. Defaults to [`Url::parse_url`].
+    /// Parse a URL from `name @ <url>`.
     fn parse_url(url: &str, working_dir: Option<&Path>) -> Result<Self, Self::Err>;
 
     /// Returns a [`Display`] implementation that doesn't mask credentials.
     fn displayable_with_credentials(&self) -> impl Display;
 }
 
+#[cfg(feature = "unsafe-url")]
+#[expect(clippy::disallowed_types, reason = "Supports the opt-in raw URL API")]
 impl Pep508Url for Url {
     type Err = url::ParseError;
 
@@ -482,7 +498,7 @@ fn parse_name<T: Pep508Url>(cursor: &mut Cursor) -> Result<PackageName, Pep508Er
         return Err(Pep508Error {
             message: Pep508ErrorSource::String("Empty field is not allowed for PEP508".to_string()),
             start: 0,
-            len: 1,
+            len: cursor.clone().at(0).peek_char().map_or(1, char::len_utf8),
             input: cursor.to_string(),
         });
     }
@@ -554,7 +570,9 @@ fn looks_like_unnamed_requirement(cursor: &mut Cursor) -> bool {
 /// Returns `true` if a file looks like an archive.
 ///
 /// See <https://github.com/pypa/pip/blob/111eed14b6e9fba7c78a5ec2b7594812d17b5d2b/src/pip/_internal/utils/filetypes.py#L8>
-/// for the list of supported archive extensions.
+/// for the original list of supported archive extensions.
+///
+/// Observe that we're currently much stricter here, as we no longer accept bz2 or lzma variants.
 fn looks_like_archive(file: impl AsRef<Path>) -> bool {
     let file = file.as_ref();
 
@@ -570,8 +588,7 @@ fn looks_like_archive(file: impl AsRef<Path>) -> bool {
 
     matches!(
         (pre_extension, extension),
-        (_, "whl" | "tbz" | "txz" | "tlz" | "zip" | "tgz" | "tar")
-            | (Some("tar"), "bz2" | "xz" | "lz" | "lzma" | "gz")
+        (_, "whl" | "zip" | "tgz" | "tar") | (Some("tar"), "gz")
     )
 }
 
@@ -1072,6 +1089,8 @@ mod tests {
     use std::str::FromStr;
 
     use insta::assert_snapshot;
+    #[cfg(feature = "unsafe-url")]
+    #[expect(clippy::disallowed_types, reason = "Exercises the opt-in raw URL API")]
     use url::Url;
 
     use uv_normalize::{ExtraName, InvalidNameError, PackageName};
@@ -1117,8 +1136,6 @@ mod tests {
             parse_pep508_err(""),
             @"
         Empty field is not allowed for PEP508
-
-        ^
         "
         );
     }
@@ -1150,7 +1167,7 @@ mod tests {
     #[test]
     fn basic_examples() {
         let input = r"requests[security,tests]==2.8.*,>=2.8.1 ; python_full_version < '2.7'";
-        let requests = Requirement::<Url>::from_str(input).unwrap();
+        let requests = Requirement::<VerbatimUrl>::from_str(input).unwrap();
         assert_eq!(input, requests.to_string());
         let expected = Requirement {
             name: PackageName::from_str("requests").unwrap(),
@@ -1189,47 +1206,48 @@ mod tests {
 
     #[test]
     fn leading_whitespace() {
-        let numpy = Requirement::<Url>::from_str(" numpy").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str(" numpy").unwrap();
         assert_eq!(numpy.name.as_ref(), "numpy");
     }
 
     #[test]
     fn parenthesized_single() {
-        let numpy = Requirement::<Url>::from_str("numpy ( >=1.19 )").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy ( >=1.19 )").unwrap();
         assert_eq!(numpy.name.as_ref(), "numpy");
     }
 
     #[test]
     fn parenthesized_double() {
-        let numpy = Requirement::<Url>::from_str("numpy ( >=1.19, <2.0 )").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy ( >=1.19, <2.0 )").unwrap();
         assert_eq!(numpy.name.as_ref(), "numpy");
     }
 
     #[test]
     fn parenthesized_trailing_comma() {
-        let numpy = Requirement::<Url>::from_str("numpy(>=1.19,<2.0,)").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy(>=1.19,<2.0,)").unwrap();
         assert_eq!(numpy.to_string(), "numpy>=1.19,<2.0");
     }
 
     #[test]
     fn versions_single() {
-        let numpy = Requirement::<Url>::from_str("numpy >=1.19 ").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy >=1.19 ").unwrap();
         assert_eq!(numpy.name.as_ref(), "numpy");
     }
 
     #[test]
     fn versions_double() {
-        let numpy = Requirement::<Url>::from_str("numpy >=1.19, <2.0 ").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy >=1.19, <2.0 ").unwrap();
         assert_eq!(numpy.name.as_ref(), "numpy");
     }
 
     #[test]
     fn versions_trailing_comma() {
-        let numpy = Requirement::<Url>::from_str("numpy>=1.19,<2.0,").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("numpy>=1.19,<2.0,").unwrap();
         assert_eq!(numpy.to_string(), "numpy>=1.19,<2.0");
 
         let numpy =
-            Requirement::<Url>::from_str("numpy >=1.19, <2.0, ; python_version < '3.13'").unwrap();
+            Requirement::<VerbatimUrl>::from_str("numpy >=1.19, <2.0, ; python_version < '3.13'")
+                .unwrap();
         assert_eq!(
             numpy.to_string(),
             "numpy>=1.19,<2.0 ; python_full_version < '3.13'"
@@ -1239,7 +1257,10 @@ mod tests {
     #[test]
     fn invalid_version_specifier_commas() {
         for input in ["numpy>=1.19,,", "numpy(>=1.19,,)", "numpy(,)"] {
-            assert!(Requirement::<Url>::from_str(input).is_err(), "{input}");
+            assert!(
+                Requirement::<VerbatimUrl>::from_str(input).is_err(),
+                "{input}"
+            );
         }
     }
 
@@ -1408,13 +1429,13 @@ mod tests {
 
     #[test]
     fn error_extras1() {
-        let numpy = Requirement::<Url>::from_str("black[d]").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("black[d]").unwrap();
         assert_eq!(*numpy.extras, [ExtraName::from_str("d").unwrap()]);
     }
 
     #[test]
     fn error_extras2() {
-        let numpy = Requirement::<Url>::from_str("black[d,jupyter]").unwrap();
+        let numpy = Requirement::<VerbatimUrl>::from_str("black[d,jupyter]").unwrap();
         assert_eq!(
             *numpy.extras,
             [
@@ -1426,13 +1447,13 @@ mod tests {
 
     #[test]
     fn empty_extras() {
-        let black = Requirement::<Url>::from_str("black[]").unwrap();
+        let black = Requirement::<VerbatimUrl>::from_str("black[]").unwrap();
         assert_eq!(*black.extras, []);
     }
 
     #[test]
     fn empty_extras_with_spaces() {
-        let black = Requirement::<Url>::from_str("black[  ]").unwrap();
+        let black = Requirement::<VerbatimUrl>::from_str("black[  ]").unwrap();
         assert_eq!(*black.extras, []);
     }
 
@@ -1494,15 +1515,38 @@ mod tests {
             name: PackageName::from_str("pip").unwrap(),
             extras: Box::new([]),
             marker: MarkerTree::TRUE,
-            version_or_url: Some(VersionOrUrl::Url(Url::parse(url).unwrap())),
+            version_or_url: Some(VersionOrUrl::Url(VerbatimUrl::parse_url(url).unwrap())),
             origin: None,
         };
         assert_eq!(pip_url, expected);
     }
 
     #[test]
+    #[cfg(feature = "unsafe-url")]
+    #[expect(clippy::disallowed_types, reason = "Exercises the opt-in raw URL API")]
+    fn raw_url_requirement() {
+        let requirement = Requirement::<Url>::from_str(
+            "demo @ https://user:password@EXAMPLE.COM/demo.whl?sig=signature",
+        )
+        .unwrap();
+        assert_snapshot!(requirement, @"demo @ https://user:password@example.com/demo.whl?sig=signature");
+    }
+
+    #[test]
+    #[cfg(feature = "unsafe-url")]
+    #[expect(clippy::disallowed_types, reason = "Exercises the opt-in raw URL API")]
+    fn raw_url_error() {
+        let error = Requirement::<Url>::from_str("demo @ not-a-url").unwrap_err();
+        assert_snapshot!(error, @"
+        relative URL without a base
+        demo @ not-a-url
+               ^^^^^^^^^
+        ");
+    }
+
+    #[test]
     fn test_marker_parsing() {
-        let marker = r#"python_version == "2.7" and (sys_platform == "win32" or (os_name == "linux" and implementation_name == 'cpython'))"#;
+        let marker = r#"python_version == "2.7" and(sys_platform == "win32" or(os_name == "linux" and implementation_name == 'cpython'))"#;
         let actual = parse::parse_markers_cursor::<VerbatimUrl>(
             &mut Cursor::new(marker),
             &mut TracingReporter,
@@ -1510,17 +1554,17 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let mut a = MarkerTree::expression(MarkerExpression::Version {
+        let a = MarkerTree::expression(MarkerExpression::Version {
             key: MarkerValueVersion::PythonVersion,
             specifier: VersionSpecifier::from_pattern(Operator::Equal, "2.7".parse().unwrap())
                 .unwrap(),
         });
-        let mut b = MarkerTree::expression(MarkerExpression::String {
+        let b = MarkerTree::expression(MarkerExpression::String {
             key: MarkerValueString::SysPlatform,
             operator: MarkerOperator::Equal,
             value: arcstr::literal!("win32"),
         });
-        let mut c = MarkerTree::expression(MarkerExpression::String {
+        let c = MarkerTree::expression(MarkerExpression::String {
             key: MarkerValueString::OsName,
             operator: MarkerOperator::Equal,
             value: arcstr::literal!("linux"),
@@ -1531,21 +1575,22 @@ mod tests {
             value: arcstr::literal!("cpython"),
         });
 
-        c.and(d);
-        b.or(c);
-        a.and(b);
+        let c = c.and(d);
+        let b = b.or(c);
+        let a = a.and(b);
 
         assert_eq!(a, actual);
     }
 
     #[test]
     fn name_and_marker() {
-        Requirement::<Url>::from_str(r#"numpy; sys_platform == "win32" or (os_name == "linux" and implementation_name == 'cpython')"#).unwrap();
+        Requirement::<VerbatimUrl>::from_str(r#"numpy; sys_platform == "win32" or (os_name == "linux" and implementation_name == 'cpython')"#).unwrap();
     }
 
     #[test]
     fn reversed_compatible_release_string_marker() {
-        let requirement = Requirement::<Url>::from_str(r#"foo; "3" ~= sys_platform"#).unwrap();
+        let requirement =
+            Requirement::<VerbatimUrl>::from_str(r#"foo; "3" ~= sys_platform"#).unwrap();
 
         assert_eq!(requirement.to_string(), "foo");
     }
@@ -1906,13 +1951,15 @@ mod tests {
 
     #[test]
     fn no_space_after_operator() {
-        let requirement = Requirement::<Url>::from_str("pytest;python_version<='4.0'").unwrap();
+        let requirement =
+            Requirement::<VerbatimUrl>::from_str("pytest;python_version<='4.0'").unwrap();
         assert_eq!(
             requirement.to_string(),
             "pytest ; python_full_version < '4.1'"
         );
 
-        let requirement = Requirement::<Url>::from_str("pytest;'4.0'>=python_version").unwrap();
+        let requirement =
+            Requirement::<VerbatimUrl>::from_str("pytest;'4.0'>=python_version").unwrap();
         assert_eq!(
             requirement.to_string(),
             "pytest ; python_full_version < '4.1'"
@@ -1955,18 +2002,19 @@ mod tests {
 
     #[test]
     fn add_extra_marker() -> Result<(), InvalidNameError> {
-        let requirement = Requirement::<Url>::from_str("pytest").unwrap();
-        let expected = Requirement::<Url>::from_str("pytest; extra == 'dotenv'").unwrap();
-        let actual = requirement.with_extra_marker(&ExtraName::from_str("dotenv")?);
+        let requirement = Requirement::<VerbatimUrl>::from_str("pytest").unwrap();
+        let expected = Requirement::<VerbatimUrl>::from_str("pytest; extra == 'dotenv'").unwrap();
+        let actual = requirement.with_extra_marker(ExtraName::from_str("dotenv")?);
         assert_eq!(actual, expected);
 
-        let requirement = Requirement::<Url>::from_str("pytest; '4.0' >= python_version").unwrap();
+        let requirement =
+            Requirement::<VerbatimUrl>::from_str("pytest; '4.0' >= python_version").unwrap();
         let expected =
             Requirement::from_str("pytest; '4.0' >= python_version and extra == 'dotenv'").unwrap();
-        let actual = requirement.with_extra_marker(&ExtraName::from_str("dotenv")?);
+        let actual = requirement.with_extra_marker(ExtraName::from_str("dotenv")?);
         assert_eq!(actual, expected);
 
-        let requirement = Requirement::<Url>::from_str(
+        let requirement = Requirement::<VerbatimUrl>::from_str(
             "pytest; '4.0' >= python_version or sys_platform == 'win32'",
         )
         .unwrap();
@@ -1974,7 +2022,7 @@ mod tests {
             "pytest; ('4.0' >= python_version or sys_platform == 'win32') and extra == 'dotenv'",
         )
         .unwrap();
-        let actual = requirement.with_extra_marker(&ExtraName::from_str("dotenv")?);
+        let actual = requirement.with_extra_marker(ExtraName::from_str("dotenv")?);
         assert_eq!(actual, expected);
 
         Ok(())

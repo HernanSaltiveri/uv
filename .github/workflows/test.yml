@@ -10,14 +10,17 @@ on:
         type: string
         default: "false"
 
-permissions: {}
+permissions:
+  contents: read
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
   PYTHON_VERSION: "3.12"
+  RUSTC_BOOTSTRAP: 1
   RUSTUP_MAX_RETRIES: 10
+  UV_LOCKED: 1
 
 jobs:
   # We use the large GitHub actions runners
@@ -29,31 +32,50 @@ jobs:
     runs-on: depot-ubuntu-24.04-16
     name: "cargo test on linux"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: "Install mold"
-        run: ./scripts/install-mold.sh
+      - name: "Install Rust toolchain"
+        run: rustup toolchain install --profile minimal
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: astral-sh/github-actions/rust-workspace-cache@52ea66bbf7dbe95fc9e2baae530cb3827214c530
         with:
+          prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
+          profile: fast-build-nightly
           save-if: ${{ inputs.save-rust-cache == 'true' }}
 
-      - name: "Install Rust toolchain"
-        run: rustup show
+      - name: "Configure Python archive cache"
+        # Share archives downloaded during setup with the tests.
+        run: echo "UV_PYTHON_CACHE_DIR=$RUNNER_TEMP/uv-python-cache" >> "$GITHUB_ENV"
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.11.19"
+          # renovate: datasource=github-release-attachments depName=astral-sh/uv
+          version: "0.13.5"
+          checksum: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
 
       - name: "Install required Python versions"
-        run: uv python install
-
-      - name: "Install secret service"
+        env:
+          UV_PYTHON_DOWNLOADS_JSON_URL: crates/uv-python-managed/download-metadata.json
         run: |
-          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
-          sudo apt install -y gnome-keyring
+          uv python install
+          # Warm the cache for Unix-only tests
+          uv python install 3.12d 3.13d 3.13t 3.13td
+
+      - name: "Install Linux test dependencies"
+        run: |
+          # Try the next configured mirror after the first failed download.
+          cat /etc/apt/apt-mirrors.txt
+          printf '%s\n' \
+            'Acquire::Retries "0";' \
+            'Acquire::http::Timeout "10";' \
+            'Acquire::https::Timeout "10";' \
+            | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
+          # Use Ubuntu's Git and matching libcurl to avoid credential failures in private-repository tests.
+          sudo apt install -y --no-install-recommends --allow-downgrades \
+            git/noble-updates git-man/noble-updates libcurl3t64-gnutls/noble-updates gnome-keyring
 
       - name: "Start gnome-keyring"
         # run gnome-keyring with 'foobar' as password for the login keyring
@@ -84,11 +106,6 @@ jobs:
           sudo mount -o loop /tmp/minix.img /minix
           sudo chown "$(id -u):$(id -g)" /minix
 
-      - name: "Install cargo nextest"
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
-        with:
-          tool: cargo-nextest
-
       - name: "Cargo test"
         env:
           # Retry more than default to reduce flakes in CI
@@ -102,9 +119,11 @@ jobs:
           INSTA_UPDATE: new
           INSTA_PENDING_DIR: ${{ github.workspace }}/pending-snapshots
         run: |
-          cargo nextest run \
-            --cargo-profile fast-build \
-            --features test-python-patch,native-auth,secret-service \
+          uv run --only-group test cargo nextest run --locked \
+            --cargo-profile fast-build-nightly \
+            -Z panic-abort-tests \
+            -Z checksum-freshness \
+            --features test-python-patch,test-universal,native-auth,secret-service \
             --workspace \
             --profile ci-linux
 
@@ -131,19 +150,22 @@ jobs:
     timeout-minutes: 20
     # Only run macOS tests on main without opt-in
     if: ${{ inputs.test-macos == 'true' }}
-    runs-on: depot-macos-15
+    runs-on: namespace-profile-macos-15
     name: "cargo test on macos"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          save-if: ${{ inputs.save-rust-cache == 'true' }}
-
       - name: "Install Rust toolchain"
-        run: rustup show
+        run: rustup toolchain install --profile minimal
+
+      - uses: astral-sh/github-actions/rust-workspace-cache@3c9fe5db47e144ea224b57565e3ab1ab769ef41d
+        with:
+          prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
+          profile: fast-build-nightly
+          save-if: ${{ inputs.save-rust-cache == 'true' }}
 
       - name: "Create HFS+ disk image (no reflink support)"
         run: |
@@ -151,17 +173,32 @@ jobs:
           hdiutil attach /tmp/noreflink.dmg
           echo "HFS_MOUNT=/Volumes/NoReflink" >> "$GITHUB_ENV"
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: "Create CI keychain"
+        # Namespace macOS runners do not start with an unlocked default user keychain. Create an
+        # empty-password keychain for native-auth tests; GitHub and Depot runners provide one.
+        run: |
+          security create-keychain -p "" "$RUNNER_TEMP/uv-ci.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/uv-ci.keychain-db"
+          security unlock-keychain -p "" "$RUNNER_TEMP/uv-ci.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/uv-ci.keychain-db"
+          security default-keychain -d user -s "$RUNNER_TEMP/uv-ci.keychain-db"
+
+      - name: "Configure Python archive cache"
+        run: echo "UV_PYTHON_CACHE_DIR=$RUNNER_TEMP/uv-python-cache" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.11.19"
+          # renovate: datasource=github-release-attachments depName=astral-sh/uv
+          version: "0.13.5"
+          checksum: "743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73"
 
       - name: "Install required Python versions"
-        run: uv python install
-
-      - name: "Install cargo nextest"
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
-        with:
-          tool: cargo-nextest
+        env:
+          UV_PYTHON_DOWNLOADS_JSON_URL: crates/uv-python-managed/download-metadata.json
+        run: |
+          uv python install
+          # Warm the cache for Unix-only tests
+          uv python install 3.12d 3.13d 3.13t 3.13td
 
       - name: "Cargo test"
         env:
@@ -177,8 +214,10 @@ jobs:
           INSTA_UPDATE: new
           INSTA_PENDING_DIR: ${{ github.workspace }}/pending-snapshots
         run: |
-          cargo nextest run \
-            --cargo-profile fast-build \
+          uv run --only-group test cargo nextest run --locked \
+            --cargo-profile fast-build-nightly \
+            -Z panic-abort-tests \
+            -Z checksum-freshness \
             --no-default-features \
             --features test-python,test-python-managed,test-pypi,test-git,test-git-lfs,performance,test-crates-io,native-auth,apple-native \
             --workspace \
@@ -205,14 +244,14 @@ jobs:
 
   cargo-test-windows:
     timeout-minutes: 15
-    runs-on: namespace-profile-windows-2022-x86-64-16
+    runs-on: namespace-profile-windows-2022-x86-64-16x32
     name: "cargo test on windows ${{ matrix.partition }} of 3"
     strategy:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -224,23 +263,30 @@ jobs:
         run: |
           Copy-Item -Path "${{ github.workspace }}" -Destination "$Env:UV_WORKSPACE" -Recurse
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.11.19"
+          # renovate: datasource=github-release-attachments depName=astral-sh/uv
+          version: "0.13.5"
+          checksum: "a38b8d1902b7cfbc76b423ba1bb456f623f42064cdc72628b6075b89afd1019a"
 
       - name: "Install required Python versions"
+        env:
+          UV_PYTHON_DOWNLOADS_JSON_URL: crates/uv-python-managed/download-metadata.json
         run: uv python install
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: ${{ env.UV_WORKSPACE }}
-          # Use the same cache entry across the partitions
-          add-job-id-key: false
-          save-if: ${{ inputs.save-rust-cache == 'true' }}
 
       - name: "Install Rust toolchain"
         working-directory: ${{ env.UV_WORKSPACE }}
-        run: rustup show
+        run: rustup toolchain install --profile minimal
+
+      - uses: astral-sh/github-actions/rust-workspace-cache@3c9fe5db47e144ea224b57565e3ab1ab769ef41d
+        with:
+          prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
+          workspace: ${{ env.UV_WORKSPACE }}
+          profile: fast-build-nightly
+          # Use the same cache entry across the partitions
+          add-job-id-key: false
+          save-if: ${{ inputs.save-rust-cache == 'true' }}
 
       - name: "Create NTFS test directory (low hardlink limit)"
         run: New-Item -Path "C:\uv" -ItemType Directory -Force
@@ -249,11 +295,6 @@ jobs:
         run: |
           New-Item -Path "C:\uv-smb" -ItemType Directory -Force
           New-SmbShare -Name "uv-alt-fs" -Path "C:\uv-smb" -FullAccess "Everyone"
-
-      - name: "Install cargo nextest"
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
-        with:
-          tool: cargo-nextest
 
       - name: "Cargo test"
         working-directory: ${{ env.UV_WORKSPACE }}
@@ -272,8 +313,10 @@ jobs:
           INSTA_PENDING_DIR: ${{ github.workspace }}/pending-snapshots
         shell: bash
         run: |
-          cargo nextest run \
-            --cargo-profile fast-build \
+          uv run --only-group test cargo nextest run --locked \
+            --cargo-profile fast-build-nightly \
+            -Z panic-abort-tests \
+            -Z checksum-freshness \
             --no-default-features \
             --features test-python,test-pypi,test-python-managed,test-windows-registry,native-auth,windows-native \
             --workspace \

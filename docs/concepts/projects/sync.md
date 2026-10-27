@@ -1,6 +1,6 @@
 # Locking and syncing
 
-Locking is the process of resolving your project's dependencies into a
+Locking is the process of [resolving](../resolution.md) your project's dependencies into a
 [lockfile](./layout.md#the-lockfile). Syncing is the process of installing a subset of packages from
 the lockfile into the [project environment](./layout.md#the-project-environment).
 
@@ -92,7 +92,7 @@ To opt-out of this behavior, use the `--no-editable` option.
 ### Handling of extraneous packages
 
 `uv sync` performs "exact" syncing by default, which means it will remove any packages that are not
-present in the lockfile.
+selected for installation.
 
 To retain extraneous packages, use the `--inexact` flag:
 
@@ -140,7 +140,7 @@ dependencies.
 
 Additional groups can be included or excluded with the `--all-groups`, `--no-default-groups`,
 `--group <name>`, `--only-group <name>`, and `--no-group <name>` options. The semantics of
-`--only-group` are the same as `--only-dev`, the project will not be included. However,
+`--only-group` are the same as `--only-dev`: the project will not be included. However,
 `--only-group` will also exclude default groups.
 
 Group exclusions always take precedence over inclusions, so given the command:
@@ -233,4 +233,8 @@ against [OSV](https://osv.dev). OSV references MAL advisories from the OpenSSF's
 
 If a locked dependency matches a malware advisory, the sync will be terminated.
 
-To enable malware checks, set `UV_MALWARE_CHECK=1` in your environment.
+To enable malware checks, set `audit.malware-check = true` in your uv settings or set
+`UV_MALWARE_CHECK=1` in your environment.
+
+To use an alternative vulnerability service, set `audit.malware-check-url` in your uv settings or
+set `UV_MALWARE_CHECK_URL` in your environment.

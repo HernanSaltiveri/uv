@@ -5,18 +5,23 @@ use std::time::{Duration, Instant};
 
 use async_http_range_reader::AsyncHttpRangeReaderError;
 use async_zip::error::ZipError;
+use owo_colors::OwoColorize;
 use reqwest::Response;
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::base_client::CertificateSource;
 use crate::middleware::OfflineError;
 use crate::{FlatIndexError, html};
 use uv_cache::Error as CacheError;
 use uv_distribution_filename::{WheelFilename, WheelFilenameError};
 use uv_distribution_types::IndexUrl;
+use uv_errors::{Hinted, Hints};
 use uv_git::GitError;
+use uv_macros::DebugNoInline;
 use uv_normalize::PackageName;
-use uv_redacted::DisplaySafeUrl;
+use uv_pypi_types::HashDigest;
+use uv_redacted::SafeUrl;
 
 /// RFC 9457 Problem Details for HTTP APIs
 ///
@@ -26,8 +31,12 @@ use uv_redacted::DisplaySafeUrl;
 pub struct ProblemDetails {
     /// A URI reference that identifies the problem type.
     /// When dereferenced, it SHOULD provide human-readable documentation for the problem type.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "deserialized for RFC 9457 completeness")
+    )]
     #[serde(rename = "type", default = "default_problem_type")]
-    pub problem_type: String,
+    problem_type: String,
 
     /// A short, human-readable summary of the problem type.
     title: Option<String>,
@@ -39,7 +48,11 @@ pub struct ProblemDetails {
     detail: Option<String>,
 
     /// A URI reference that identifies the specific occurrence of the problem.
-    pub instance: Option<String>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "deserialized for RFC 9457 completeness")
+    )]
+    instance: Option<String>,
 }
 
 /// Default problem type URI as per RFC 9457
@@ -147,6 +160,44 @@ impl std::error::Error for Error {
 }
 
 impl Error {
+    /// Return whether this is an expected user-facing failure.
+    pub fn is_user_failure(&self) -> bool {
+        match self.kind() {
+            ErrorKind::InvalidUrl(_)
+            | ErrorKind::MissingWheelGitLfsArtifacts(..)
+            | ErrorKind::NonFileUrl(_)
+            | ErrorKind::CannotBeABase(_)
+            | ErrorKind::Metadata(..)
+            | ErrorKind::NoIndex(_)
+            | ErrorKind::RemotePackageNotFound(_)
+            | ErrorKind::LocalPackageNotFound(_)
+            | ErrorKind::LocalIndexNotFound(_)
+            | ErrorKind::MetadataHashMismatch { .. }
+            | ErrorKind::MetadataParseError(..)
+            | ErrorKind::BadJson { .. }
+            | ErrorKind::BadHtml { .. }
+            | ErrorKind::MetadataRangeRequestsRequired(..)
+            | ErrorKind::WheelFilename(_)
+            | ErrorKind::NameMismatch { .. }
+            | ErrorKind::Zip(..)
+            | ErrorKind::MissingContentType(_)
+            | ErrorKind::InvalidContentTypeHeader(..)
+            | ErrorKind::UnsupportedMediaType(..)
+            | ErrorKind::Offline(_) => true,
+            ErrorKind::Git(error) => error.is_user_failure(),
+            ErrorKind::WrappedReqwestError(_, error) => error.is_user_failure(),
+            ErrorKind::Flat(error) => error.is_user_failure(),
+            ErrorKind::AsyncHttpRangeReader(..)
+            | ErrorKind::CacheWrite(_)
+            | ErrorKind::CacheLock(_)
+            | ErrorKind::Io(_)
+            | ErrorKind::Decode(_)
+            | ErrorKind::Encode(_)
+            | ErrorKind::ArchiveRead(_)
+            | ErrorKind::ArchiveWrite(_) => false,
+        }
+    }
+
     /// Create a new [`Error`] with the given [`ErrorKind`] and number of retries.
     pub fn new(kind: ErrorKind, retries: u32, duration: Duration) -> Self {
         Self {
@@ -183,25 +234,21 @@ impl Error {
     }
 
     /// Create a new error from a JSON parsing error.
-    pub(crate) fn from_json_err(err: serde_json::Error, url: DisplaySafeUrl) -> Self {
+    pub(crate) fn from_json_err(err: serde_json::Error, url: SafeUrl) -> Self {
         ErrorKind::BadJson { source: err, url }.into()
     }
 
     /// Create a new error from an HTML parsing error.
-    pub(crate) fn from_html_err(err: html::Error, url: DisplaySafeUrl) -> Self {
+    pub(crate) fn from_html_err(err: html::Error, url: SafeUrl) -> Self {
         ErrorKind::BadHtml { source: err, url }.into()
-    }
-
-    /// Create a new error from a `MessagePack` parsing error.
-    pub(crate) fn from_msgpack_err(err: rmp_serde::decode::Error, url: DisplaySafeUrl) -> Self {
-        ErrorKind::BadMessagePack { source: err, url }.into()
     }
 
     /// Create an [`Error`] from a [`reqwest_middleware::Error`].
     pub(crate) fn from_reqwest_middleware(
-        url: DisplaySafeUrl,
+        url: SafeUrl,
         err: reqwest_middleware::Error,
         start: Instant,
+        certificate_source: CertificateSource,
     ) -> Self {
         if let reqwest_middleware::Error::Middleware(ref underlying) = err {
             if let Some(offline_err) = underlying.downcast_ref::<OfflineError>() {
@@ -212,7 +259,10 @@ impl Error {
             {
                 let retries = *retries;
                 return Self::new(
-                    ErrorKind::WrappedReqwestError(url, WrappedReqwestError::from(err)),
+                    ErrorKind::WrappedReqwestError(
+                        url,
+                        WrappedReqwestError::from(err).with_certificate_source(certificate_source),
+                    ),
                     retries,
                     start.elapsed(),
                 );
@@ -220,7 +270,7 @@ impl Error {
         }
         Self::from(ErrorKind::WrappedReqwestError(
             url,
-            WrappedReqwestError::from(err),
+            WrappedReqwestError::from(err).with_certificate_source(certificate_source),
         ))
     }
 
@@ -237,15 +287,18 @@ impl Error {
         matches!(err.kind(), std::io::ErrorKind::NotFound)
     }
 
-    /// Returns `true` if the error is due to an SSL error.
-    pub fn is_ssl(&self) -> bool {
-        matches!(&*self.kind, ErrorKind::WrappedReqwestError(.., err) if err.is_ssl())
+    /// Returns `true` if this TLS error could be resolved by using system certificate roots.
+    fn suggests_system_certs(&self) -> bool {
+        matches!(
+            &*self.kind,
+            ErrorKind::WrappedReqwestError(_, err) if err.suggests_system_certs()
+        )
     }
 
     /// Returns `true` if the error is due to the server not supporting HTTP range requests.
     pub(crate) fn is_http_range_requests_unsupported(
         &self,
-        url: &DisplaySafeUrl,
+        url: &SafeUrl,
         index: Option<&IndexUrl>,
     ) -> bool {
         match &*self.kind {
@@ -287,64 +340,61 @@ impl Error {
 
             // The server returned a "Method Not Allowed" error, indicating it doesn't support
             // HEAD requests, so we can't check for range requests.
-            ErrorKind::WrappedReqwestError(_, err) => {
-                if let Some(status) = err.status() {
-                    // If the server doesn't support HEAD requests, we can't check for range
-                    // requests.
-                    if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-                        return true;
-                    }
+            ErrorKind::WrappedReqwestError(_, err) if let Some(status) = err.status() => {
+                // If the server doesn't support HEAD requests, we can't check for range
+                // requests.
+                if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+                    return true;
+                }
 
-                    // In some cases, registries return a 404 for HEAD requests when they're not
-                    // supported. In the worst case, we'll now just proceed to attempt to stream the
-                    // entire file, so it's fine to be somewhat lenient here.
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        return true;
-                    }
+                // In some cases, registries return a 404 for HEAD requests when they're not
+                // supported. In the worst case, we'll now just proceed to attempt to stream the
+                // entire file, so it's fine to be somewhat lenient here.
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return true;
+                }
 
-                    // In some cases, registries (like PyPICloud) return a 403 for HEAD requests
-                    // when they're not supported. Again, it's better to be lenient here.
-                    if status == reqwest::StatusCode::FORBIDDEN {
-                        return true;
-                    }
+                // In some cases, registries (like PyPICloud) return a 403 for HEAD requests
+                // when they're not supported. Again, it's better to be lenient here.
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    return true;
+                }
 
-                    // In some cases, registries (like Alibaba Cloud) return a 400 for HEAD requests
-                    // when they're not supported. Again, it's better to be lenient here.
-                    if status == reqwest::StatusCode::BAD_REQUEST {
-                        return true;
-                    }
+                // In some cases, registries (like Alibaba Cloud) return a 400 for HEAD requests
+                // when they're not supported. Again, it's better to be lenient here.
+                if status == reqwest::StatusCode::BAD_REQUEST {
+                    return true;
                 }
             }
 
             // The server doesn't support range requests, but we only discovered this while
             // unzipping due to erroneous server behavior.
-            ErrorKind::Zip(_, ZipError::UpstreamReadError(err)) => {
+            ErrorKind::Zip(_, ZipError::UpstreamReadError(err))
                 if let Some(inner) = err.get_ref()
                     && let Some(range_reader_error) =
-                        inner.downcast_ref::<AsyncHttpRangeReaderError>()
-                {
-                    match range_reader_error {
-                        AsyncHttpRangeReaderError::HttpRangeRequestUnsupported
-                        | AsyncHttpRangeReaderError::ContentLengthMissing
-                        | AsyncHttpRangeReaderError::ContentRangeMissing => {
-                            return true;
-                        }
-                        AsyncHttpRangeReaderError::RangeMismatch { .. }
-                        | AsyncHttpRangeReaderError::ResponseTooShort { .. }
-                        | AsyncHttpRangeReaderError::ResponseTooLong { .. } => {
-                            let url = if let Some(index) = index {
-                                index.url()
-                            } else {
-                                url
-                            };
-                            warn!(
-                                "Invalid range request response from server that declares HTTP \
-                                range request support, falling back to streaming: {url}"
-                            );
-                            return true;
-                        }
-                        _ => {}
+                        inner.downcast_ref::<AsyncHttpRangeReaderError>() =>
+            {
+                match range_reader_error {
+                    AsyncHttpRangeReaderError::HttpRangeRequestUnsupported
+                    | AsyncHttpRangeReaderError::ContentLengthMissing
+                    | AsyncHttpRangeReaderError::ContentRangeMissing => {
+                        return true;
                     }
+                    AsyncHttpRangeReaderError::RangeMismatch { .. }
+                    | AsyncHttpRangeReaderError::ResponseTooShort { .. }
+                    | AsyncHttpRangeReaderError::ResponseTooLong { .. } => {
+                        let url = if let Some(index) = index {
+                            index.url()
+                        } else {
+                            url
+                        };
+                        warn!(
+                            "Invalid range request response from server that declares HTTP \
+                            range request support, falling back to streaming: {url}"
+                        );
+                        return true;
+                    }
+                    _ => {}
                 }
             }
 
@@ -365,6 +415,19 @@ impl Error {
     }
 }
 
+impl Hinted for Error {
+    fn hints(&self) -> Hints<'_> {
+        if self.suggests_system_certs() {
+            Hints::from(format!(
+                "Consider enabling use of system TLS certificates with the `{}` command-line flag",
+                "--system-certs".green()
+            ))
+        } else {
+            Hints::none()
+        }
+    }
+}
+
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self {
@@ -375,7 +438,7 @@ impl From<ErrorKind> for Error {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(DebugNoInline, thiserror::Error)]
 pub enum ErrorKind {
     #[error(transparent)]
     InvalidUrl(#[from] uv_distribution_types::ToUrlError),
@@ -387,15 +450,15 @@ pub enum ErrorKind {
     Git(#[from] uv_git::GitResolverError),
 
     #[error("The wheel `{0}` is missing Git LFS artifacts.")]
-    MissingWheelGitLfsArtifacts(DisplaySafeUrl, #[source] GitError),
+    MissingWheelGitLfsArtifacts(SafeUrl, #[source] GitError),
 
     #[error("Expected a file URL, but received: {0}")]
-    NonFileUrl(DisplaySafeUrl),
+    NonFileUrl(SafeUrl),
 
     #[error("Expected an index URL, but received non-base URL: {0}")]
-    CannotBeABase(DisplaySafeUrl),
+    CannotBeABase(SafeUrl),
 
-    #[error("Failed to read metadata: `{0}`")]
+    #[error("Failed to read metadata: {0}")]
     Metadata(String, #[source] uv_metadata::Error),
 
     #[error("{0} isn't available locally, but making network requests to registries was banned")]
@@ -413,11 +476,21 @@ pub enum ErrorKind {
     LocalPackageNotFound(PackageName),
 
     /// The root was not found in the local (file-based) index.
-    #[error("Local index not found at: `{}`", _0.display())]
+    #[error("Local index not found at: {}", _0.display())]
     LocalIndexNotFound(PathBuf),
 
+    /// The metadata file does not match a hash provided by its package index.
+    #[error(
+        "Hash mismatch for package metadata at `{url}`\n\nExpected:\n  {expected}\n\nComputed:\n  {actual}"
+    )]
+    MetadataHashMismatch {
+        url: SafeUrl,
+        expected: HashDigest,
+        actual: HashDigest,
+    },
+
     /// The metadata file could not be parsed.
-    #[error("Couldn't parse metadata of {0} from {1}")]
+    #[error("Couldn't parse metadata of `{0}` from `{1}`")]
     MetadataParseError(
         WheelFilename,
         String,
@@ -425,29 +498,23 @@ pub enum ErrorKind {
     ),
 
     /// An error that happened while making a request or in a reqwest middleware.
-    #[error("Failed to fetch: `{0}`")]
-    WrappedReqwestError(DisplaySafeUrl, #[source] WrappedReqwestError),
+    #[error("Failed to fetch: {0}")]
+    WrappedReqwestError(SafeUrl, #[source] WrappedReqwestError),
 
-    #[error("Received some unexpected JSON from {}", url)]
+    #[error("Received some unexpected JSON from `{}`", url)]
     BadJson {
         source: serde_json::Error,
-        url: DisplaySafeUrl,
+        url: SafeUrl,
     },
 
-    #[error("Received some unexpected HTML from {}", url)]
-    BadHtml {
-        source: html::Error,
-        url: DisplaySafeUrl,
-    },
+    #[error("Received some unexpected HTML from `{}`", url)]
+    BadHtml { source: html::Error, url: SafeUrl },
 
-    #[error("Received some unexpected MessagePack from {}", url)]
-    BadMessagePack {
-        source: rmp_serde::decode::Error,
-        url: DisplaySafeUrl,
-    },
+    #[error("Failed to read zip with range requests: {0}")]
+    AsyncHttpRangeReader(SafeUrl, #[source] AsyncHttpRangeReaderError),
 
-    #[error("Failed to read zip with range requests: `{0}`")]
-    AsyncHttpRangeReader(DisplaySafeUrl, #[source] AsyncHttpRangeReaderError),
+    #[error("Wheel metadata range requests are required, but not supported for: {0}")]
+    MetadataRangeRequestsRequired(SafeUrl, #[source] Box<Error>),
 
     #[error("{0} is not a valid wheel filename")]
     WheelFilename(#[source] WheelFilenameError),
@@ -476,14 +543,14 @@ pub enum ErrorKind {
     #[error("Cache serialization failed")]
     Encode(#[source] rmp_serde::encode::Error),
 
-    #[error("Missing `Content-Type` header for {0}")]
-    MissingContentType(DisplaySafeUrl),
+    #[error("Missing `Content-Type` header for `{0}`")]
+    MissingContentType(SafeUrl),
 
-    #[error("Invalid `Content-Type` header for {0}")]
-    InvalidContentTypeHeader(DisplaySafeUrl, #[source] http::header::ToStrError),
+    #[error("Invalid `Content-Type` header for `{0}`")]
+    InvalidContentTypeHeader(SafeUrl, #[source] http::header::ToStrError),
 
-    #[error("Unsupported `Content-Type` \"{1}\" for {0}. Expected JSON or HTML.")]
-    UnsupportedMediaType(DisplaySafeUrl, String),
+    #[error("Unsupported `Content-Type` \"{1}\" for `{0}`. Expected JSON or HTML.")]
+    UnsupportedMediaType(SafeUrl, String),
 
     #[error("Reading from cache archive failed: {0}")]
     ArchiveRead(String),
@@ -492,20 +559,27 @@ pub enum ErrorKind {
     ArchiveWrite(String),
 
     #[error(
-        "Network connectivity is disabled, but the requested data wasn't found in the cache for: `{0}`"
+        "Network connectivity is disabled, but the requested data wasn't found in the cache: {0}"
     )]
     Offline(String),
 }
 
 impl ErrorKind {
     /// Create an [`ErrorKind`] from a [`reqwest::Error`].
-    pub(crate) fn from_reqwest(url: DisplaySafeUrl, error: reqwest::Error) -> Self {
-        Self::WrappedReqwestError(url, WrappedReqwestError::from(error))
+    pub(crate) fn from_reqwest(
+        url: SafeUrl,
+        error: reqwest::Error,
+        certificate_source: CertificateSource,
+    ) -> Self {
+        Self::WrappedReqwestError(
+            url,
+            WrappedReqwestError::from(error).with_certificate_source(certificate_source),
+        )
     }
 
     /// Create an [`ErrorKind`] from a [`reqwest::Error`] with problem details.
     pub(crate) fn from_reqwest_with_problem_details(
-        url: DisplaySafeUrl,
+        url: SafeUrl,
         error: reqwest::Error,
         problem_details: Option<ProblemDetails>,
     ) -> Self {
@@ -524,10 +598,23 @@ impl ErrorKind {
 #[derive(Debug)]
 pub struct WrappedReqwestError {
     error: reqwest_middleware::Error,
-    problem_details: Option<Box<ProblemDetails>>,
+    context: Option<Box<WrappedReqwestErrorContext>>,
+}
+
+#[derive(Debug)]
+enum WrappedReqwestErrorContext {
+    ProblemDetails(ProblemDetails),
+    TlsCertificateSource(CertificateSource),
 }
 
 impl WrappedReqwestError {
+    /// Return whether the request failed because the resource does not exist.
+    pub fn is_user_failure(&self) -> bool {
+        self.inner()
+            .and_then(reqwest::Error::status)
+            .is_some_and(|status| status == reqwest::StatusCode::NOT_FOUND)
+    }
+
     /// Create a new `WrappedReqwestError` with optional problem details
     pub fn with_problem_details(
         error: reqwest_middleware::Error,
@@ -535,8 +622,29 @@ impl WrappedReqwestError {
     ) -> Self {
         Self {
             error: Self::filter_retries_from_error(error),
-            problem_details: problem_details.map(Box::new),
+            context: problem_details
+                .map(WrappedReqwestErrorContext::ProblemDetails)
+                .map(Box::new),
         }
+    }
+
+    #[must_use]
+    fn with_certificate_source(mut self, certificate_source: CertificateSource) -> Self {
+        if self.is_ssl() {
+            self.context = Some(Box::new(WrappedReqwestErrorContext::TlsCertificateSource(
+                certificate_source,
+            )));
+        }
+        self
+    }
+
+    fn suggests_system_certs(&self) -> bool {
+        matches!(
+            self.context.as_deref(),
+            Some(WrappedReqwestErrorContext::TlsCertificateSource(
+                CertificateSource::WebPki
+            ))
+        )
     }
 
     /// Drop `RetryError::WithRetries` to avoid reporting the number of retries twice.
@@ -626,7 +734,7 @@ impl From<reqwest::Error> for WrappedReqwestError {
         Self {
             // No need to filter retries as this error does not have retries.
             error: error.into(),
-            problem_details: None,
+            context: None,
         }
     }
 }
@@ -635,7 +743,7 @@ impl From<reqwest_middleware::Error> for WrappedReqwestError {
     fn from(error: reqwest_middleware::Error) -> Self {
         Self {
             error: Self::filter_retries_from_error(error),
-            problem_details: None,
+            context: None,
         }
     }
 }
@@ -653,7 +761,9 @@ impl Display for WrappedReqwestError {
         if self.is_likely_offline() {
             // Insert an extra hint, we'll show the wrapped error through `source`
             f.write_str("Could not connect, are you offline?")
-        } else if let Some(problem_details) = &self.problem_details {
+        } else if let Some(WrappedReqwestErrorContext::ProblemDetails(problem_details)) =
+            self.context.as_deref()
+        {
             // Show problem details if available
             match problem_details.description() {
                 None => Display::fmt(&self.error, f),
@@ -671,7 +781,10 @@ impl std::error::Error for WrappedReqwestError {
         if self.is_likely_offline() {
             // `Display` is inserting an extra message, so we need to show the wrapped error
             Some(&self.error)
-        } else if self.problem_details.is_some() {
+        } else if matches!(
+            self.context.as_deref(),
+            Some(WrappedReqwestErrorContext::ProblemDetails(_))
+        ) {
             // `Display` is showing problem details, so show the wrapped error as source
             Some(&self.error)
         } else {

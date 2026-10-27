@@ -46,11 +46,10 @@ the `pyproject.toml`, `setup.py`, or `setup.cfg` file in the directory root has 
 re-installs than desired.
 
 To incorporate additional information into the cache key for a given package, you can add cache key
-entries under [`tool.uv.cache-keys`](https://docs.astral.sh/uv/reference/settings/#cache-keys),
-which covers both file paths and Git commit hashes. Setting
-[`tool.uv.cache-keys`](https://docs.astral.sh/uv/reference/settings/#cache-keys) will replace
-defaults, so any necessary files (like `pyproject.toml`) should still be included in the
-user-defined cache keys.
+entries under [`tool.uv.cache-keys`](../reference/settings.md#cache-keys), which covers both file
+paths and Git commit hashes. Setting [`tool.uv.cache-keys`](../reference/settings.md#cache-keys)
+will replace defaults, so any necessary files (like `pyproject.toml`) should still be included in
+the user-defined cache keys.
 
 For example, if a project specifies dependencies in `pyproject.toml` but uses
 [`setuptools-scm`](https://pypi.org/project/setuptools-scm/) to manage its version, and should thus
@@ -90,8 +89,8 @@ cache-keys = [{ file = "**/*.toml" }]
 
 !!! note
 
-    The use of globs can be expensive, as uv may need to walk the filesystem to determine whether any files have changed.
-    This may, in turn, requiring traversal of large or deeply nested directories.
+    Globs can be expensive because uv may need to traverse large or deeply nested directories to
+    determine whether any files have changed.
 
 Similarly, if a project relies on an environment variable, you can add the following to the
 project's `pyproject.toml` to invalidate the cache whenever the environment variable changes:
@@ -127,9 +126,12 @@ package's `pyproject.toml`, `setup.py`, or `setup.cfg` file has changed.
 ## Cache safety
 
 It's safe to run multiple uv commands concurrently, even against the same virtual environment. uv's
-cache is designed to be thread-safe and append-only, and thus robust to multiple concurrent readers
-and writers. uv applies a file-based lock to the target virtual environment when installing, to
-avoid concurrent modifications across processes.
+cache supports multiple concurrent readers and writers. uv applies a file-based lock to the target
+virtual environment when installing, to avoid concurrent modifications across processes.
+
+Interrupted or overlapping HTTP cache refreshes can invalidate individual cache entries. uv detects
+incomplete policy updates and downloads the response again instead of using the invalid entry. With
+`--offline`, an affected entry is unavailable until it can be refreshed online.
 
 Note that it's _never_ safe to modify the cache directly (e.g., by removing a file or directory).
 
@@ -138,11 +140,26 @@ Note that it's _never_ safe to modify the cache directly (e.g., by removing a fi
 uv provides a few different mechanisms for removing entries from the cache:
 
 - `uv cache clean` removes _all_ cache entries from the cache directory, clearing it out entirely.
+  The directory and its lock file remain so that other uv processes can safely share the cache.
 - `uv cache clean ruff` removes all cache entries for the `ruff` package, useful for invalidating
   the cache for a single or finite set of packages.
-- `uv cache prune` removes all _unused_ cache entries. For example, the cache directory may contain
-  entries created in previous uv versions that are no longer necessary and can be safely removed.
-  `uv cache prune` is safe to run periodically, to keep the cache directory clean.
+- `uv cache prune` removes all _unused_ cache entries and all centralized project environments. For
+  example, the cache directory may contain entries created in previous uv versions that are no
+  longer necessary and can be safely removed. Centralized project environments are recreated as
+  needed. `uv cache prune` is safe to run periodically, to keep the cache directory clean.
+
+By default, cache cleanup estimates the disk space reclaimed. Enable the `cache-physical-space`
+[preview feature](./preview.md) for a more accurate estimate that accounts for hardlinks and
+copy-on-write clones:
+
+```console
+$ uv cache clean --preview-features cache-physical-space
+```
+
+If an entry's allocated size cannot be measured, such as a compressed extent on Btrfs, uv reports a
+lower bound for the space reclaimed from the remaining entries. The preview feature is currently
+supported on macOS and Linux; other platforms continue reporting a coarser estimate of the space
+reclaimed.
 
 uv blocks cache-modifying operations while other uv commands are running. By default, those
 `uv cache` commands have a 5 min timeout waiting for other uv processes to terminate to avoid
@@ -172,7 +189,7 @@ integration job to ensure maximum cache efficiency. For an example, see the
 
 ## Cache directory
 
-uv determines the cache directory according to, in order:
+uv determines the cache directory in the following order:
 
 1. A temporary cache directory, if `--no-cache` was requested.
 2. The specific cache directory specified via `--cache-dir`, `UV_CACHE_DIR`, or
@@ -188,9 +205,9 @@ uv determines the cache directory according to, in order:
     In most cases, `--refresh` should be used instead of `--no-cache` — as it will update the cache
     for subsequent operations but not read from the cache.
 
-It is important for performance for the cache directory to be located on the same file system as the
-Python environment uv is operating on. Otherwise, uv will not be able to link files from the cache
-into the environment and will instead need to fallback to slow copy operations.
+For best performance, locate the cache directory on the same file system as the Python environment
+uv is operating on. Otherwise, uv cannot link files from the cache into the environment and must
+fall back to slower copy operations.
 
 ## Cache versioning
 

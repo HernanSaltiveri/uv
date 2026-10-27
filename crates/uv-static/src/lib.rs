@@ -8,6 +8,28 @@ use std::borrow::Cow;
 
 use thiserror::Error;
 
+/// The implementation used to read and write tar archives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TarBackend {
+    #[default]
+    TarCodec,
+    TokioTar,
+}
+
+impl TarBackend {
+    /// Select the tar implementation, allowing users to enable the legacy backend.
+    pub fn from_env() -> Self {
+        if matches!(
+            parse_boolish_environment_variable(EnvVars::UV_LEGACY_TAR_BACKEND),
+            Ok(Some(true))
+        ) {
+            Self::TokioTar
+        } else {
+            Self::TarCodec
+        }
+    }
+}
+
 /// The base URL for the default Astral mirror.
 const ASTRAL_MIRROR_BASE_URL: &str = "https://releases.astral.sh";
 
@@ -25,7 +47,7 @@ pub fn astral_mirror_url_from_env() -> Option<String> {
 /// Return the effective Astral mirror base URL, using the default mirror when unset.
 pub fn astral_mirror_base_url(astral_mirror_url: Option<&str>) -> Cow<'_, str> {
     custom_astral_mirror_url(astral_mirror_url)
-        .map(|url| Cow::Owned(url.trim_end_matches('/').to_string()))
+        .map(|url| Cow::Borrowed(url.trim_end_matches('/')))
         .unwrap_or(Cow::Borrowed(ASTRAL_MIRROR_BASE_URL))
 }
 
@@ -63,7 +85,7 @@ pub fn parse_boolish_environment_variable(
     //
     // Any other value will be considered as `true`.
     fn str_to_bool(val: impl AsRef<str>) -> Option<bool> {
-        let pat: &str = &val.as_ref().to_lowercase();
+        let pat: &str = &val.as_ref().to_ascii_lowercase();
         if TRUE_LITERALS.contains(&pat) {
             Some(true)
         } else if FALSE_LITERALS.contains(&pat) {

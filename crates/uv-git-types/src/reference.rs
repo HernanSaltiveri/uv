@@ -1,7 +1,10 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::str;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+use crate::GitOid;
 
 /// Percent-encode Git revisions for use after the `@` in VCS URLs.
 ///
@@ -17,13 +20,15 @@ const GIT_REFERENCE_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// A reference to commit or commit-ish.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GitReference {
+    /// A specific commit, identified by its full object ID.
+    Commit(GitOid),
     /// A specific branch.
     Branch(String),
     /// A specific tag.
     Tag(String),
     /// From a reference that's ambiguously a branch or tag.
     BranchOrTag(String),
-    /// From a reference that's ambiguously a commit, branch, or tag.
+    /// An ambiguous reference, including abbreviated commits and hexadecimal branch or tag names.
     BranchOrTagOrCommit(String),
     /// From a named reference, like `refs/pull/493/head`.
     NamedRef(String),
@@ -37,6 +42,8 @@ impl GitReference {
     pub fn from_rev(rev: String) -> Self {
         if rev.starts_with("refs/") {
             Self::NamedRef(rev)
+        } else if let Ok(commit) = rev.parse() {
+            Self::Commit(commit)
         } else if looks_like_commit_hash(&rev) {
             Self::BranchOrTagOrCommit(rev)
         } else {
@@ -47,6 +54,7 @@ impl GitReference {
     /// Converts the [`GitReference`] to a `str`.
     pub fn as_str(&self) -> Option<&str> {
         match self {
+            Self::Commit(commit) => Some(commit.as_str()),
             Self::Tag(rev) => Some(rev),
             Self::Branch(rev) => Some(rev),
             Self::BranchOrTag(rev) => Some(rev),
@@ -59,6 +67,7 @@ impl GitReference {
     /// Converts the [`GitReference`] to a `str` that can be used as a revision.
     pub fn as_rev(&self) -> &str {
         match self {
+            Self::Commit(commit) => commit.as_str(),
             Self::Tag(rev) => rev,
             Self::Branch(rev) => rev,
             Self::BranchOrTag(rev) => rev,
@@ -69,18 +78,32 @@ impl GitReference {
     }
 
     /// Converts the [`GitReference`] to a percent-encoded revision string for use in a URL.
-    pub fn as_url_rev(&self) -> Option<String> {
+    pub fn as_url_rev(&self) -> Option<Cow<'_, str>> {
         self.as_str().map(Self::encode_rev)
     }
 
+    /// Return the commit identified directly by this reference, without resolving named references.
+    pub fn as_commit(&self) -> Option<GitOid> {
+        match self {
+            Self::Commit(commit) => Some(*commit),
+            Self::Branch(_)
+            | Self::Tag(_)
+            | Self::BranchOrTag(_)
+            | Self::BranchOrTagOrCommit(_)
+            | Self::NamedRef(_)
+            | Self::DefaultBranch => None,
+        }
+    }
+
     /// Percent-encode a revision string for use in a URL.
-    pub(crate) fn encode_rev(rev: &str) -> String {
-        utf8_percent_encode(rev, GIT_REFERENCE_ENCODE_SET).to_string()
+    fn encode_rev(rev: &str) -> Cow<'_, str> {
+        utf8_percent_encode(rev, GIT_REFERENCE_ENCODE_SET).into()
     }
 
     /// Returns the kind of this reference.
     pub fn kind_str(&self) -> &str {
         match self {
+            Self::Commit(_) => "commit",
             Self::Branch(_) => "branch",
             Self::Tag(_) => "tag",
             Self::BranchOrTag(_) => "branch or tag",

@@ -1,12 +1,15 @@
+use std::borrow::Cow;
+#[cfg(any(test, feature = "testing"))]
+use std::ops::BitOr;
 use std::sync::{Mutex, OnceLock};
 use std::{
     fmt::{Debug, Display, Formatter},
-    ops::BitOr,
     str::FromStr,
 };
 
 use enumflags2::{BitFlags, bitflags};
 use thiserror::Error;
+use uv_macros::PreviewMetadata;
 use uv_warnings::warn_user_once;
 
 /// Indicates if the preview state has been finalized yet or not.
@@ -219,87 +222,246 @@ pub mod test {
 }
 
 #[bitflags]
+#[expect(
+    clippy::use_self,
+    reason = "enumflags2 refers to the enum by name when inferring bits"
+)]
 #[repr(u64)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PreviewMetadata)]
 pub enum PreviewFeature {
-    PythonInstallDefault = 1 << 0,
-    PythonUpgrade = 1 << 1,
-    JsonOutput = 1 << 2,
-    Pylock = 1 << 3,
-    AddBounds = 1 << 4,
-    PackageConflicts = 1 << 5,
-    ExtraBuildDependencies = 1 << 6,
-    DetectModuleConflicts = 1 << 7,
-    Format = 1 << 8,
-    NativeAuth = 1 << 9,
-    S3Endpoint = 1 << 10,
-    CacheSize = 1 << 11,
-    InitProjectFlag = 1 << 12,
-    WorkspaceMetadata = 1 << 13,
-    WorkspaceDir = 1 << 14,
-    WorkspaceList = 1 << 15,
-    SbomExport = 1 << 16,
-    AuthHelper = 1 << 17,
-    DirectPublish = 1 << 18,
-    TargetWorkspaceDiscovery = 1 << 19,
-    MetadataJson = 1 << 20,
-    GcsEndpoint = 1 << 21,
-    AdjustUlimit = 1 << 22,
-    SpecialCondaEnvNames = 1 << 23,
-    RelocatableEnvsDefault = 1 << 24,
-    PublishRequireNormalized = 1 << 25,
-    Audit = 1 << 26,
-    ProjectDirectoryMustExist = 1 << 27,
-    IndexExcludeNewer = 1 << 28,
-    AzureEndpoint = 1 << 29,
-    TomlBackwardsCompatibility = 1 << 30,
-    MalwareCheck = 1 << 31,
-    VenvSafeClear = 1 << 32,
-    Check = 1 << 33,
-    PackagedInit = 1 << 34,
-}
-
-impl PreviewFeature {
-    /// Returns the string representation of a single preview feature flag.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PythonInstallDefault => "python-install-default",
-            Self::PythonUpgrade => "python-upgrade",
-            Self::JsonOutput => "json-output",
-            Self::Pylock => "pylock",
-            Self::AddBounds => "add-bounds",
-            Self::PackageConflicts => "package-conflicts",
-            Self::ExtraBuildDependencies => "extra-build-dependencies",
-            Self::DetectModuleConflicts => "detect-module-conflicts",
-            Self::Format => "format-command",
-            Self::NativeAuth => "native-auth",
-            Self::S3Endpoint => "s3-endpoint",
-            Self::CacheSize => "cache-size",
-            Self::InitProjectFlag => "init-project-flag",
-            Self::WorkspaceMetadata => "workspace-metadata",
-            Self::WorkspaceDir => "workspace-dir",
-            Self::WorkspaceList => "workspace-list",
-            Self::SbomExport => "sbom-export",
-            Self::AuthHelper => "auth-helper",
-            Self::DirectPublish => "direct-publish",
-            Self::TargetWorkspaceDiscovery => "target-workspace-discovery",
-            Self::MetadataJson => "metadata-json",
-            Self::GcsEndpoint => "gcs-endpoint",
-            Self::AdjustUlimit => "adjust-ulimit",
-            Self::SpecialCondaEnvNames => "special-conda-env-names",
-            Self::RelocatableEnvsDefault => "relocatable-envs-default",
-            Self::PublishRequireNormalized => "publish-require-normalized",
-            Self::Audit => "audit-command",
-            Self::ProjectDirectoryMustExist => "project-directory-must-exist",
-            Self::IndexExcludeNewer => "index-exclude-newer",
-            Self::AzureEndpoint => "azure-endpoint",
-            Self::TomlBackwardsCompatibility => "toml-backwards-compatibility",
-            Self::MalwareCheck => "malware-check",
-            Self::VenvSafeClear => "venv-safe-clear",
-            Self::Check => "check-command",
-            Self::PackagedInit => "packaged-init",
-        }
-    }
+    /// The `uv python install --default` option installs `python` and `python3` executables
+    /// alongside the versioned executable, making a uv-managed Python available without specifying
+    /// its minor version. When no version is requested and no `.python-version` file is found,
+    /// enabling this feature also makes `uv python install` create these executables by default.
+    /// See [installing Python executables](./python-versions.md#installing-python-executables) for
+    /// details about the installation location and handling of existing executables.
+    PythonInstallDefault,
+    /// Commands that support `--output-format json`, such as `uv tree`, can produce
+    /// machine-readable output for use by other tools. The JSON schemas are experimental and may
+    /// change without warning; enabling this feature silences the preview warning.
+    JsonOutput,
+    /// The `uv pip install` and `uv pip sync` commands can install dependencies from `pylock.toml`
+    /// files, the standardized Python lockfile format. For example, use
+    /// `uv pip install -r pylock.toml` or `uv pip sync pylock.toml`; enabling this feature silences
+    /// the preview warning.
+    Pylock,
+    /// The [`add-bounds`](../reference/settings.md#add-bounds) setting controls the default version
+    /// bounds added by `uv add`. Instead of the default lower bound, dependencies can be
+    /// constrained to a major or minor version range, or pinned to an exact version.
+    AddBounds,
+    /// Workspace members can declare [conflicting
+    /// dependencies](./resolution.md#conflicting-dependencies) at the package level, in addition to
+    /// conflicts between extras or dependency groups. This allows members with incompatible
+    /// requirements to share a lockfile, provided they are not installed together.
+    PackageConflicts,
+    /// The [`extra-build-dependencies`](./projects/config.md#augmenting-build-dependencies) setting
+    /// augments a package's declared build dependencies without disabling build isolation. It can
+    /// supply a missing build dependency or, with `match-runtime = true`, ensure that a build
+    /// dependency uses the same version as the project environment.
+    ExtraBuildDependencies,
+    /// uv warns when multiple packages install conflicting Python modules into the same
+    /// environment. These conflicts can cause imports to depend on installation order, even when
+    /// the packages have different distribution names.
+    DetectModuleConflicts,
+    /// The `uv format` command formats Python code with Ruff, downloading the formatter when
+    /// needed. It can also check formatting with `--check` or show proposed changes with `--diff`;
+    /// enabling this feature silences the preview warning.
+    #[preview(alias = "format")]
+    FormatCommand,
+    /// The `uv auth` commands store credentials in a [system-native
+    /// location](./authentication/http.md#the-uv-credentials-store), using Keychain Services on
+    /// macOS, Credential Manager on Windows, or the Secret Service API on Linux. uv only retrieves
+    /// credentials that it has stored itself, rather than credentials saved by other applications.
+    NativeAuth,
+    /// uv can authenticate requests to an S3-compatible storage endpoint using AWS Signature
+    /// Version 4. Set [`UV_S3_ENDPOINT_URL`](../reference/environment.md#uv_s3_endpoint_url) to
+    /// identify the endpoint; credentials are obtained from the configured AWS credential sources.
+    S3Endpoint,
+    /// The `uv cache size` command reports the total size of uv's cache. It supports human-readable
+    /// output and a machine-readable byte count; enabling this feature silences the preview
+    /// warning.
+    CacheSize,
+    /// Cache cleanup reports the physical disk space reclaimed, accounting for hardlinks and
+    /// copy-on-write clones on macOS and Linux. If an entry's allocated size cannot be measured, uv
+    /// reports a lower bound; other platforms continue to use a coarser estimate. See [clearing the
+    /// cache](./cache.md#clearing-the-cache) for details.
+    CachePhysicalSpace,
+    /// The `uv init` command rejects the deprecated `--project` option. To choose where to create a
+    /// project, pass the target directory as a positional argument, such as `uv init my-project`.
+    InitProjectFlag,
+    /// The `uv workspace metadata` command exposes structured information about a workspace and its
+    /// resolved dependencies for use by other tools. Its output is experimental and may change; use
+    /// `--sync` to include a mapping from importable modules to the packages that provide them.
+    WorkspaceMetadata,
+    /// The `uv workspace dir` command prints the path to the workspace root. Use `--package` to
+    /// print the path to a specific workspace member, for example, with `--package my-package`.
+    WorkspaceDir,
+    /// The `uv workspace list` command lists the names of workspace members, with one name per
+    /// line. Use `--paths` to display their paths instead, for example, when passing workspace
+    /// directories to another tool.
+    WorkspaceList,
+    /// The `uv export --format cyclonedx1.5` command exports a software bill of materials in
+    /// CycloneDX 1.5 JSON format. This describes the locked dependencies in a format that can be
+    /// consumed by software inventory and security tools.
+    SbomExport,
+    /// The [`uv auth helper`](./authentication/cli.md#using-credentials-with-external-tools)
+    /// command lets external tools retrieve HTTP credentials through uv. It currently supports the
+    /// Bazel credential helper protocol, reading a JSON request from standard input and writing a
+    /// JSON response containing authentication headers when credentials are available.
+    AuthHelper,
+    /// For a local `uv run` target, uv starts project and workspace discovery from the directory
+    /// containing the target instead of the current working directory. This feature takes effect
+    /// before configuration is loaded, so it must be enabled on the command line or through an
+    /// environment variable.
+    TargetWorkspaceDiscovery,
+    /// The uv build backend includes `METADATA.json` and `WHEEL.json` files in built wheels
+    /// alongside the standard `METADATA` and `WHEEL` files. These additional files expose package
+    /// and wheel metadata in JSON format.
+    MetadataJson,
+    /// uv can authenticate requests to a Google Cloud Storage endpoint using Google Cloud
+    /// credentials. Set [`UV_GCS_ENDPOINT_URL`](../reference/environment.md#uv_gcs_endpoint_url) to
+    /// identify the endpoint; authentication uses `GOOGLE_APPLICATION_CREDENTIALS` or Application
+    /// Default Credentials.
+    GcsEndpoint,
+    /// On Unix, uv raises the process's soft open-file limit at startup, up to the hard limit. This
+    /// helps avoid "too many open files" errors during concurrent operations, and child processes
+    /// inherit the raised limit.
+    AdjustUlimit,
+    /// Conda environments named `base` or `root` are classified using their paths, like other named
+    /// environments. The name alone does not cause uv to treat a user-created environment as the
+    /// base Conda installation.
+    SpecialCondaEnvNames,
+    /// uv creates relocatable virtual environments by default, using relative paths in their entry
+    /// point and activation scripts. This allows the environment to be moved without invalidating
+    /// those scripts, although arbitrary binaries and nonstandard scripts are not guaranteed to be
+    /// relocatable. Use `uv venv --no-relocatable` to opt out.
+    RelocatableEnvsDefault,
+    /// The `uv publish` command requires distribution filenames to be normalized. Files with
+    /// non-normalized names are skipped when selecting distributions to upload.
+    PublishRequireNormalized,
+    /// The `uv audit` and `uv tool audit` commands check project and installed-tool dependencies
+    /// for known vulnerabilities. Tool audits use the lockfiles recorded by the
+    /// [`tool-install-locks`](#tool-install-locks) feature; enabling both features silences the
+    /// preview warning for `uv tool audit`.
+    #[preview(alias = "audit")]
+    AuditCommand,
+    /// The `--project` option rejects invalid paths instead of warning and continuing in the
+    /// current directory. Except for `uv init`, the path must already exist as a directory or point
+    /// to a `pyproject.toml` file. This feature takes effect before configuration is loaded, so it
+    /// must be enabled on the command line or through an environment variable.
+    ProjectDirectoryMustExist,
+    /// Each configured package index can set its own
+    /// [`exclude-newer`](./indexes.md#configuring-exclude-newer-for-an-index) cutoff, overriding
+    /// the global cutoff for packages served by that index. Set the value to `false` to disable the
+    /// cutoff for an index; package-specific `exclude-newer-package` values still take precedence.
+    IndexExcludeNewer,
+    /// uv can authenticate requests to an Azure Blob Storage endpoint using Azure credentials. Set
+    /// [`UV_AZURE_ENDPOINT_URL`](../reference/environment.md#uv_azure_endpoint_url) to identify the
+    /// endpoint; authentication uses the default Azure credential chain, including Azure CLI
+    /// credentials and workload identity.
+    AzureEndpoint,
+    /// When building source distributions, the uv build backend rewrites `pyproject.toml` as TOML
+    /// 1.0 for compatibility with older build tools. The original file is included as
+    /// `pyproject.toml.orig` in the source distribution.
+    TomlBackwardsCompatibility,
+    /// The `uv sync` command and other installation commands can check packages for malware using
+    /// [OSV](https://osv.dev) before installing them. This checks for known malicious packages,
+    /// while [`uv audit`](#audit-command) checks dependencies for known vulnerabilities.
+    MalwareCheck,
+    /// The `uv venv --clear` option refuses to clear a directory that does not contain a
+    /// `pyvenv.cfg` file. This helps avoid removing unrelated files when the target is not a
+    /// virtual environment; use `--force` to explicitly allow clearing such a directory.
+    VenvSafeClear,
+    /// The `uv check` command runs Python type checking with ty. It uses the project's environment
+    /// to resolve imports and can synchronize that environment before checking; enabling this
+    /// feature silences the preview warning.
+    #[preview(alias = "check")]
+    CheckCommand,
+    /// The `uv init` command creates a packaged application by default, with a `src/` layout, a
+    /// build system, and a script entry point. This gives new applications an installable package
+    /// structure without requiring `--package`.
+    PackagedInit,
+    /// uv stores default [project virtual
+    /// environments](./projects/layout.md#centralized-project-environments) in its cache and
+    /// attempts to link `.venv` to the cached environment. Switching interpreters selects separate
+    /// cached environments that can be reused later. Explicit environment paths and environments
+    /// selected with `--active` are not centralized.
+    CentralizedProjectEnvs,
+    /// uv stores a `uv.lock` file alongside each installed tool and reuses it for subsequent
+    /// installations and upgrades. The lockfile records the tool's resolved dependencies and also
+    /// provides the dependency information used by `uv tool audit`.
+    ToolInstallLocks,
+    /// The `uv workspace list --scripts` command lists standalone Python scripts with inline
+    /// metadata under the workspace root. It prints script paths relative to the workspace root,
+    /// allowing tools to discover scripts separately from workspace members.
+    WorkspaceListScripts,
+    /// Each configured package index can [require a hash
+    /// algorithm](./indexes.md#requiring-a-hash-algorithm) with the `hash-algorithm` setting. uv
+    /// records that algorithm's hash in the lockfile and fails if a distribution does not advertise
+    /// it, instead of selecting another available algorithm.
+    IndexHashAlgorithm,
+    /// Commands using `--locked` or `--check` reject non-canonical lockfile formatting, even if the
+    /// lockfile can be parsed. This makes formatting part of the lockfile check in addition to
+    /// checking whether the resolution is up to date.
+    LockfileFormatCheck,
+    /// uv combines equivalent dependency declarations when writing lockfiles. This reduces
+    /// duplicated declarations in the recorded requirements, constraints, overrides, exclusions,
+    /// and dependency groups.
+    LockfileNormalization,
+    /// uv omits the `package.metadata` tables from `uv.lock`, except for remote URL and Git
+    /// dependencies. Their metadata is retained so uv can check whether those sources are requested
+    /// or stale without network access.
+    LockWithoutMetadata,
+    /// The `--index` and `--default-index` options accept the names of configured package indexes
+    /// as well as URLs. For example, `--index internal` selects the configured index named
+    /// `internal`, so its URL does not need to be repeated on the command line.
+    IndexByName,
+    /// The `uv pip compile --generate-hashes` command restricts the generated hashes to artifacts
+    /// allowed by the selected binary and build policies. For example, when source builds are
+    /// disabled, hashes for source distributions are omitted.
+    ArtifactHashFiltering,
+    /// uv identifies cached wheel archives by a digest of their contents. Matching archive contents
+    /// can share a cache entry, reducing duplication when the same wheel contents are encountered
+    /// more than once.
+    ContentAddressedCache,
+    /// uv omits `exclude-newer-package` entries from the lockfile when the corresponding packages
+    /// are absent from the resolved dependencies. This keeps cutoffs for unrelated packages out of
+    /// `uv.lock`.
+    MissingExcludeNewerPackageLock,
+    /// uv omits redundant runtime constraints and unused overrides, exclusions, dependency
+    /// metadata, and package-specific upload cutoffs from the lockfile. It records which settings
+    /// were consulted during resolution, including backtracking, so settings that affected
+    /// resolution can be retained even when their packages are absent from the final dependency
+    /// graph.
+    ResolutionInputs,
+    /// The `uv export --batch` option exports multiple dependency selections from a TOML manifest
+    /// containing `[[export]]` entries. Each entry specifies an `output-file` and its own package,
+    /// extra, and dependency group selections; output paths are relative to the manifest.
+    BatchExport,
+    /// Frozen project commands can use `uv.lock` without the workspace's `pyproject.toml` file.
+    /// Discovery requires a lockfile with revision 5 or later, which records the workspace
+    /// information needed to select dependencies without the manifest.
+    FrozenLockfile,
+    /// The [`minimum-libc-version`](./resolution.md#minimum-libc-version) setting specifies the
+    /// oldest glibc or musl versions that must be supported during universal resolution. Use it
+    /// with `required-environments` to require compatible wheels for the selected Linux
+    /// environments without excluding wheels for newer libc versions.
+    MinimumLibcVersion,
+    /// Before a nonisolated `uv build`, uv checks that the selected environment satisfies declared,
+    /// backend-reported, and transitive build requirements. This reports missing or incompatible
+    /// build dependencies before building; use `--skip-dependency-check` to skip the check.
+    BuildDependencyCheck,
+    /// uv enables lazy imports when invoking build backends on CPython 3.15 and later. This can
+    /// reduce the work performed by imports during a build, but can also change import-time side
+    /// effects in third-party build backends.
+    BuildLazyImports,
+    /// The `--require-build-hashes` option requires hashes for every build dependency, including
+    /// transitive dependencies. It applies when build dependencies are downloaded during builds,
+    /// project resolution, and installation. See [project build dependency
+    /// hashes](./projects/build.md#project-build-dependency-hashes) for configuration and exceptions.
+    BuildDependencyHashes,
+    /// Enables experimental support for [wheel variants](https://peps.python.org/pep-0825/).
+    WheelVariants,
 }
 
 impl Display for PreviewFeature {
@@ -316,44 +478,11 @@ impl FromStr for PreviewFeature {
     type Err = PreviewFeatureParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "python-install-default" => Self::PythonInstallDefault,
-            "python-upgrade" => Self::PythonUpgrade,
-            "json-output" => Self::JsonOutput,
-            "pylock" => Self::Pylock,
-            "add-bounds" => Self::AddBounds,
-            "package-conflicts" => Self::PackageConflicts,
-            "extra-build-dependencies" => Self::ExtraBuildDependencies,
-            "detect-module-conflicts" => Self::DetectModuleConflicts,
-            "format" | "format-command" => Self::Format,
-            "native-auth" => Self::NativeAuth,
-            "s3-endpoint" => Self::S3Endpoint,
-            "gcs-endpoint" => Self::GcsEndpoint,
-            "cache-size" => Self::CacheSize,
-            "init-project-flag" => Self::InitProjectFlag,
-            "workspace-metadata" => Self::WorkspaceMetadata,
-            "workspace-dir" => Self::WorkspaceDir,
-            "workspace-list" => Self::WorkspaceList,
-            "sbom-export" => Self::SbomExport,
-            "auth-helper" => Self::AuthHelper,
-            "direct-publish" => Self::DirectPublish,
-            "target-workspace-discovery" => Self::TargetWorkspaceDiscovery,
-            "metadata-json" => Self::MetadataJson,
-            "adjust-ulimit" => Self::AdjustUlimit,
-            "special-conda-env-names" => Self::SpecialCondaEnvNames,
-            "relocatable-envs-default" => Self::RelocatableEnvsDefault,
-            "publish-require-normalized" => Self::PublishRequireNormalized,
-            "audit" | "audit-command" => Self::Audit,
-            "project-directory-must-exist" => Self::ProjectDirectoryMustExist,
-            "index-exclude-newer" => Self::IndexExcludeNewer,
-            "azure-endpoint" => Self::AzureEndpoint,
-            "toml-backwards-compatibility" => Self::TomlBackwardsCompatibility,
-            "malware-check" => Self::MalwareCheck,
-            "venv-safe-clear" => Self::VenvSafeClear,
-            "check" | "check-command" => Self::Check,
-            "packaged-init" => Self::PackagedInit,
-            _ => return Err(PreviewFeatureParseError),
-        })
+        Self::metadata()
+            .iter()
+            .find(|(feature, _, aliases)| feature.as_str() == s || aliases.contains(&s))
+            .map(|(feature, _, _)| *feature)
+            .ok_or(PreviewFeatureParseError)
     }
 }
 
@@ -384,6 +513,43 @@ impl FromStr for MaybePreviewFeature {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for MaybePreviewFeature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name: Cow<'de, str> = serde::Deserialize::deserialize(deserializer)?;
+        Self::from_str(&name).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for MaybePreviewFeature {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PreviewFeature")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Advertise canonical names for editor completions, while accepting any nonempty name to
+        // match the forwards-compatible runtime parsing behavior.
+        let choices: Vec<&str> = BitFlags::<PreviewFeature>::all()
+            .iter()
+            .map(PreviewFeature::as_str)
+            .collect();
+        schemars::json_schema!({
+            "type": "string",
+            "anyOf": [
+                {
+                    "enum": choices,
+                },
+                {
+                    "pattern": "\\S",
+                },
+            ],
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Preview {
     flags: BitFlags<PreviewFeature>,
@@ -397,7 +563,8 @@ impl Debug for Preview {
 }
 
 impl Preview {
-    pub fn new(flags: &[PreviewFeature]) -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    fn new(flags: &[PreviewFeature]) -> Self {
         Self {
             flags: flags.iter().copied().fold(BitFlags::empty(), BitOr::bitor),
         }
@@ -407,23 +574,6 @@ impl Preview {
         Self {
             flags: BitFlags::all(),
         }
-    }
-
-    /// Resolve preview arguments, warning and ignoring unknown feature names.
-    pub fn from_args(
-        preview: bool,
-        no_preview: bool,
-        preview_features: &[MaybePreviewFeature],
-    ) -> Self {
-        if no_preview {
-            return Self::default();
-        }
-
-        if preview {
-            return Self::all();
-        }
-
-        Self::from_feature_names(preview_features)
     }
 
     /// Check if a single feature is enabled.
@@ -441,7 +591,8 @@ impl Preview {
         !self.flags.is_empty()
     }
 
-    fn from_feature_names<'a>(
+    /// Resolve preview feature names, warning and ignoring unknown names.
+    pub fn from_feature_names<'a>(
         feature_names: impl IntoIterator<Item = &'a MaybePreviewFeature>,
     ) -> Self {
         let mut flags = BitFlags::empty();
@@ -494,8 +645,13 @@ mod tests {
 
     #[test]
     fn test_preview_feature_from_str() {
-        let features = PreviewFeature::from_str("python-install-default").unwrap();
-        assert_eq!(features, PreviewFeature::PythonInstallDefault);
+        for &(feature, _, aliases) in PreviewFeature::metadata() {
+            assert_eq!(PreviewFeature::from_str(feature.as_str()).unwrap(), feature);
+
+            for &alias in aliases {
+                assert_eq!(PreviewFeature::from_str(alias).unwrap(), feature);
+            }
+        }
     }
 
     #[test]
@@ -505,10 +661,13 @@ mod tests {
         assert_eq!(preview.flags, PreviewFeature::PythonInstallDefault);
 
         // Test multiple features
-        let preview = Preview::from_str("python-upgrade,json-output").unwrap();
-        assert!(preview.is_enabled(PreviewFeature::PythonUpgrade));
+        let preview = Preview::from_str("json-output,pylock").unwrap();
         assert!(preview.is_enabled(PreviewFeature::JsonOutput));
+        assert!(preview.is_enabled(PreviewFeature::Pylock));
         assert_eq!(preview.flags.bits().count_ones(), 2);
+
+        let preview = Preview::from_str("tool-install-locks").unwrap();
+        assert!(preview.is_enabled(PreviewFeature::ToolInstallLocks));
 
         // Test with whitespace
         let preview = Preview::from_str("pylock , add-bounds").unwrap();
@@ -543,113 +702,8 @@ mod tests {
         assert_eq!(preview.to_string(), "python-install-default");
 
         // Test multiple features
-        let preview = Preview::new(&[PreviewFeature::PythonUpgrade, PreviewFeature::Pylock]);
-        assert_eq!(preview.to_string(), "python-upgrade,pylock");
-    }
-
-    #[test]
-    fn test_preview_from_args() {
-        // Test no preview and no no_preview, and no features
-        let preview = Preview::from_args(false, false, &[]);
-        assert_eq!(preview.to_string(), "disabled");
-
-        // Test no_preview
-        let preview = Preview::from_args(true, true, &[]);
-        assert_eq!(preview.to_string(), "disabled");
-
-        // Test preview (all features)
-        let preview = Preview::from_args(true, false, &[]);
-        assert_eq!(preview.to_string(), "enabled");
-
-        // Test specific features
-        let features = ["python-upgrade", "json-output"].map(|name| name.parse().unwrap());
-        let preview = Preview::from_args(false, false, &features);
-        assert!(preview.is_enabled(PreviewFeature::PythonUpgrade));
-        assert!(preview.is_enabled(PreviewFeature::JsonOutput));
-        assert!(!preview.is_enabled(PreviewFeature::Pylock));
-
-        // Test unknown features
-        let features = ["unknown-feature", "pylock"].map(|name| name.parse().unwrap());
-        let preview = Preview::from_args(false, false, &features);
-        assert!(preview.is_enabled(PreviewFeature::Pylock));
-        assert_eq!(preview.flags.bits().count_ones(), 1);
-    }
-
-    #[test]
-    fn test_preview_feature_as_str() {
-        assert_eq!(
-            PreviewFeature::PythonInstallDefault.as_str(),
-            "python-install-default"
-        );
-        assert_eq!(PreviewFeature::PythonUpgrade.as_str(), "python-upgrade");
-        assert_eq!(PreviewFeature::JsonOutput.as_str(), "json-output");
-        assert_eq!(PreviewFeature::Pylock.as_str(), "pylock");
-        assert_eq!(PreviewFeature::AddBounds.as_str(), "add-bounds");
-        assert_eq!(
-            PreviewFeature::PackageConflicts.as_str(),
-            "package-conflicts"
-        );
-        assert_eq!(
-            PreviewFeature::ExtraBuildDependencies.as_str(),
-            "extra-build-dependencies"
-        );
-        assert_eq!(
-            PreviewFeature::DetectModuleConflicts.as_str(),
-            "detect-module-conflicts"
-        );
-        assert_eq!(PreviewFeature::Format.as_str(), "format-command");
-        assert_eq!(PreviewFeature::NativeAuth.as_str(), "native-auth");
-        assert_eq!(PreviewFeature::S3Endpoint.as_str(), "s3-endpoint");
-        assert_eq!(PreviewFeature::CacheSize.as_str(), "cache-size");
-        assert_eq!(
-            PreviewFeature::InitProjectFlag.as_str(),
-            "init-project-flag"
-        );
-        assert_eq!(
-            PreviewFeature::WorkspaceMetadata.as_str(),
-            "workspace-metadata"
-        );
-        assert_eq!(PreviewFeature::WorkspaceDir.as_str(), "workspace-dir");
-        assert_eq!(PreviewFeature::WorkspaceList.as_str(), "workspace-list");
-        assert_eq!(PreviewFeature::SbomExport.as_str(), "sbom-export");
-        assert_eq!(PreviewFeature::AuthHelper.as_str(), "auth-helper");
-        assert_eq!(PreviewFeature::DirectPublish.as_str(), "direct-publish");
-        assert_eq!(
-            PreviewFeature::TargetWorkspaceDiscovery.as_str(),
-            "target-workspace-discovery"
-        );
-        assert_eq!(PreviewFeature::MetadataJson.as_str(), "metadata-json");
-        assert_eq!(PreviewFeature::GcsEndpoint.as_str(), "gcs-endpoint");
-        assert_eq!(PreviewFeature::AdjustUlimit.as_str(), "adjust-ulimit");
-        assert_eq!(
-            PreviewFeature::SpecialCondaEnvNames.as_str(),
-            "special-conda-env-names"
-        );
-        assert_eq!(
-            PreviewFeature::RelocatableEnvsDefault.as_str(),
-            "relocatable-envs-default"
-        );
-        assert_eq!(
-            PreviewFeature::PublishRequireNormalized.as_str(),
-            "publish-require-normalized"
-        );
-        assert_eq!(
-            PreviewFeature::ProjectDirectoryMustExist.as_str(),
-            "project-directory-must-exist"
-        );
-        assert_eq!(
-            PreviewFeature::IndexExcludeNewer.as_str(),
-            "index-exclude-newer"
-        );
-        assert_eq!(PreviewFeature::AzureEndpoint.as_str(), "azure-endpoint");
-        assert_eq!(
-            PreviewFeature::TomlBackwardsCompatibility.as_str(),
-            "toml-backwards-compatibility"
-        );
-        assert_eq!(PreviewFeature::MalwareCheck.as_str(), "malware-check");
-        assert_eq!(PreviewFeature::VenvSafeClear.as_str(), "venv-safe-clear");
-        assert_eq!(PreviewFeature::Audit.as_str(), "audit-command");
-        assert_eq!(PreviewFeature::Check.as_str(), "check-command");
+        let preview = Preview::new(&[PreviewFeature::JsonOutput, PreviewFeature::Pylock]);
+        assert_eq!(preview.to_string(), "json-output,pylock");
     }
 
     #[test]

@@ -46,9 +46,9 @@ the locked dependencies.
 
 To define dependencies in a `requirements.in` file:
 
-```python title="requirements.in"
+```requirements title="requirements.in"
 httpx
 ruff>=0.3.0
 ```
 
-Optional dependencies groups are not supported in this format.
+Optional dependency groups are not supported in this format.

@@ -3,6 +3,7 @@ use regex_automata::dfa;
 use regex_automata::dfa::Automaton;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path};
 use tracing::warn;
+use walkdir::DirEntry;
 
 /// Chosen at a whim -Konsti
 const DFA_SIZE_LIMIT: usize = 1_000_000;
@@ -21,13 +22,7 @@ impl GlobDirFilter {
     /// The filter matches if any of the globs matches.
     ///
     /// See <https://github.com/BurntSushi/ripgrep/discussions/2927> for the error returned.
-    pub fn from_globs(globs: &[Glob]) -> Result<Self, globset::Error> {
-        let mut glob_set_builder = GlobSetBuilder::new();
-        for glob in globs {
-            glob_set_builder.add(glob.clone());
-        }
-        let glob_set = glob_set_builder.build()?;
-
+    pub fn from_globs(globs: Vec<Glob>) -> Result<Self, globset::Error> {
         let regexes: Vec<_> = globs
             .iter()
             .map(|glob| {
@@ -41,6 +36,12 @@ impl GlobDirFilter {
                     .replace('/', &main_separator)
             })
             .collect();
+
+        let mut glob_set_builder = GlobSetBuilder::new();
+        for glob in globs {
+            glob_set_builder.add(glob);
+        }
+        let glob_set = glob_set_builder.build()?;
 
         let dfa_builder = dfa::dense::Builder::new()
             .syntax(
@@ -72,11 +73,23 @@ impl GlobDirFilter {
         Ok(Self { glob_set, dfa })
     }
 
-    /// Whether the path (file or directory) matches any of the globs.
+    /// Whether a file path matches any complete glob.
+    pub fn match_file(&self, path: &Path) -> bool {
+        self.glob_set.is_match(path)
+    }
+
+    /// Whether the entry at the given relative path matches any of the globs.
     ///
-    /// We include a directory if we are potentially including files it contains.
-    pub fn match_path(&self, path: &Path) -> bool {
-        self.match_directory(path) || self.glob_set.is_match(path)
+    /// We include a directory if we are potentially including files it contains. Symlinks whose
+    /// target is not known to be a file are included conservatively so callers can handle them.
+    pub fn match_path(&self, path: &Path, entry: &DirEntry) -> bool {
+        if self.match_file(path) {
+            return true;
+        }
+
+        let file_type = entry.file_type();
+        (file_type.is_dir() || (file_type.is_symlink() && !entry.path().is_file()))
+            && self.match_directory(path)
     }
 
     /// Check whether a directory or any of its children can be matched by any of the globs.
@@ -152,7 +165,7 @@ mod tests {
     #[test]
     fn match_directory() {
         let patterns = PATTERNS.map(|pattern| PortableGlobParser::Pep639.parse(pattern).unwrap());
-        let matcher = GlobDirFilter::from_globs(&patterns).unwrap();
+        let matcher = GlobDirFilter::from_globs(patterns.into_iter().collect()).unwrap();
         assert!(matcher.match_directory(&Path::new("path1").join("dir1")));
         assert!(matcher.match_directory(&Path::new("path2").join("dir2")));
         assert!(matcher.match_directory(&Path::new("path3").join("dir3")));
@@ -170,7 +183,7 @@ mod tests {
             fs_err::File::create(file).unwrap();
         }
         let patterns = PATTERNS.map(|pattern| PortableGlobParser::Pep639.parse(pattern).unwrap());
-        let matcher = GlobDirFilter::from_globs(&patterns).unwrap();
+        let matcher = GlobDirFilter::from_globs(patterns.into_iter().collect()).unwrap();
 
         // Test the prefix filtering
         let visited: Vec<_> = WalkDir::new(dir.path())
@@ -229,7 +242,7 @@ mod tests {
         }
         let patterns = PATTERNS.map(|pattern| PortableGlobParser::Pep639.parse(pattern).unwrap());
 
-        let include_matcher = GlobDirFilter::from_globs(&patterns).unwrap();
+        let include_matcher = GlobDirFilter::from_globs(patterns.into_iter().collect()).unwrap();
 
         let walkdir_root = dir.path();
         let mut matches: Vec<_> = WalkDir::new(walkdir_root)
@@ -251,7 +264,7 @@ mod tests {
                     .path()
                     .strip_prefix(walkdir_root)
                     .expect("walkdir starts with root");
-                if include_matcher.match_path(relative) {
+                if include_matcher.match_path(relative, entry) {
                     // Translate windows paths back to the unix fixture
                     Some(relative.to_str().unwrap().replace(MAIN_SEPARATOR, "/"))
                 } else {

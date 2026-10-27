@@ -1,44 +1,45 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{str::FromStr, sync::Arc};
 
+use astral_html::{Attribute, Document, Element};
 use jiff::Timestamp;
-use tl::{HTMLTag, Node, Parser};
+use rustc_hash::FxHashMap;
 use tracing::{debug, instrument, warn};
 
 use uv_normalize::PackageName;
-use uv_pep440::VersionSpecifiers;
+use uv_pep440::{VersionSpecifiers, VersionSpecifiersParseError};
 use uv_pypi_types::{BaseUrl, CoreMetadata, Hashes, ProjectStatus, PypiFile, Status, Yanked};
 use uv_pypi_types::{HashError, LenientVersionSpecifiers};
-use uv_redacted::{DisplaySafeUrl, DisplaySafeUrlError};
+use uv_redacted::{SafeUrl, SafeUrlError};
 use uv_small_str::SmallString;
 
-/// Return `true` if this tag has the given HTML element name.
-fn is_tag(tag: &HTMLTag<'_>, name: &[u8]) -> bool {
-    tag.name().as_bytes().eq_ignore_ascii_case(name)
+type RequiresPythonResult = Result<Arc<VersionSpecifiers>, VersionSpecifiersParseError>;
+
+#[derive(Default)]
+struct RequiresPythonInterner {
+    values: FxHashMap<SmallString, RequiresPythonResult>,
+}
+
+impl RequiresPythonInterner {
+    fn parse(&mut self, value: &str) -> RequiresPythonResult {
+        if let Some(requires_python) = self.values.get(value) {
+            return requires_python.clone();
+        }
+
+        let requires_python = LenientVersionSpecifiers::from_str(value)
+            .map(VersionSpecifiers::from)
+            .map(Arc::new);
+        self.values
+            .insert(SmallString::from(value), requires_python.clone());
+        requires_python
+    }
 }
 
 /// Return the value of the attribute with the given case-insensitive HTML attribute name.
-fn attribute<'a>(tag: &'a HTMLTag<'_>, name: &'a str) -> Option<Cow<'a, str>> {
-    tag.attributes()
-        .get(name)
-        .flatten()
-        .map(tl::Bytes::as_utf8_str)
-        .or_else(|| {
-            tag.attributes().iter().find_map(|(attribute_name, value)| {
-                attribute_name
-                    .eq_ignore_ascii_case(name)
-                    .then_some(value)
-                    .flatten()
-            })
-        })
-}
-
-/// Return `true` if the tag has the given case-insensitive HTML attribute name.
-fn has_attribute<'a>(tag: &'a HTMLTag<'_>, name: &'a str) -> bool {
-    tag.attributes().contains(name)
-        || tag
-            .attributes()
-            .iter()
-            .any(|(attribute_name, _)| attribute_name.eq_ignore_ascii_case(name))
+/// Boolean attributes have no value.
+fn attribute<'a>(tag: &'a Element<'_, '_>, name: &str) -> Option<&'a str> {
+    tag.attribute(name)
+        .filter(|attribute| attribute.raw_value().is_some())
+        .map(Attribute::value)
 }
 
 /// A parsed structure from PyPI "HTML" index format for a single package.
@@ -56,42 +57,38 @@ pub(crate) struct SimpleDetailHTML {
 impl SimpleDetailHTML {
     /// Parse the list of [`PypiFile`]s from the simple HTML page returned by the given URL.
     #[instrument(skip_all, fields(url = % url))]
-    pub(crate) fn parse(text: &str, url: &DisplaySafeUrl) -> Result<Self, Error> {
-        let dom = tl::parse(text, tl::ParserOptions::default())?;
+    pub(crate) fn parse(text: &str, url: &SafeUrl) -> Result<Self, Error> {
+        let dom = Document::parse(text)?;
 
         // Project status information appears in the `<meta>` tags in the `<head>`.
         // Specifically, it appears as `name="pypi:project-status"`
         // and `name="pypi:project-status-reason"` with corresponding
         // `content` attributes.
         let project_status = dom
-            .nodes()
-            .iter()
-            .find(|node| node.as_tag().is_some_and(|tag| is_tag(tag, b"head")))
-            .and_then(|head| Self::parse_project_status(dom.parser(), head))
+            .elements()
+            .find(|element| element.is("head"))
+            .and_then(Self::parse_project_status)
             .unwrap_or_default();
 
         // Parse the first `<base>` tag, if any, to determine the base URL to which all
         // relative URLs should be resolved. The HTML spec requires that the `<base>` tag
         // appear before other tags with attribute values of URLs.
         let base = BaseUrl::from(
-            dom.nodes()
-                .iter()
-                .filter_map(|node| node.as_tag())
-                .take_while(|tag| !is_tag(tag, b"a") && !is_tag(tag, b"link"))
-                .find(|tag| is_tag(tag, b"base"))
-                .map(|base| Self::parse_base(base))
+            dom.elements()
+                .take_while(|tag| !tag.is("a") && !tag.is("link"))
+                .find(|tag| tag.is("base"))
+                .map(|base| Self::parse_base(&base))
                 .transpose()?
                 .flatten()
                 .unwrap_or_else(|| url.clone()),
         );
 
         // Parse each `<a>` tag, to extract the filename, hash, and URL.
+        let mut interner = RequiresPythonInterner::default();
         let mut files: Vec<PypiFile> = dom
-            .nodes()
-            .iter()
-            .filter_map(|node| node.as_tag())
-            .filter(|link| is_tag(link, b"a"))
-            .map(|link| Self::parse_anchor(link))
+            .elements()
+            .filter(|link| link.is("a"))
+            .map(|link| Self::parse_anchor(&link, &mut interner))
             .filter_map(|result| match result {
                 Ok(None) => None,
                 Ok(Some(file)) => Some(Ok(file)),
@@ -118,34 +115,26 @@ impl SimpleDetailHTML {
     /// Parse a [`ProjectStatus`] from the `<meta>` tags in the given `<head>`.
     ///
     /// Precondition: `head` is a `<head>` tag.
-    fn parse_project_status(parser: &Parser, head: &Node) -> Option<ProjectStatus> {
-        let children = head.children()?;
-
+    fn parse_project_status(head: Element<'_, '_>) -> Option<ProjectStatus> {
         let mut status: Option<Status> = None;
         let mut reason: Option<SmallString> = None;
-        for node in children.all(parser) {
-            let tag = match node.as_tag() {
-                Some(tag) if is_tag(tag, b"meta") => tag,
-                _ => continue,
-            };
-
-            let Some(name) = attribute(tag, "name") else {
+        for tag in head.descendants().filter(|tag| tag.is("meta")) {
+            let Some(name) = attribute(&tag, "name") else {
                 continue;
             };
 
             // Per PEP 792: both `pypi:project-status` and `pypi:project-status-reason`
             // are optional, but if present should be well-formed.
-            match name.as_ref() {
+            match name {
                 "pypi:project-status" => {
                     status = {
-                        let status = attribute(tag, "content").as_deref().and_then(Status::new)?;
+                        let status = attribute(&tag, "content").and_then(Status::new)?;
                         Some(status)
                     };
                 }
                 "pypi:project-status-reason" => {
                     reason = {
-                        let Some(content) =
-                            attribute(tag, "content").as_deref().map(SmallString::from)
+                        let Some(content) = attribute(&tag, "content").map(SmallString::from)
                         else {
                             // TODO: Make this a hard error instead?
                             warn!("Invalid project status reason (missing)");
@@ -167,27 +156,28 @@ impl SimpleDetailHTML {
     }
 
     /// Parse the `href` from a `<base>` tag.
-    fn parse_base(base: &HTMLTag) -> Result<Option<DisplaySafeUrl>, Error> {
+    fn parse_base(base: &Element<'_, '_>) -> Result<Option<SafeUrl>, Error> {
         let Some(href) = attribute(base, "href") else {
             return Ok(None);
         };
-        let url =
-            DisplaySafeUrl::parse(&href).map_err(|err| Error::UrlParse(href.to_string(), err))?;
+        let url = SafeUrl::parse(href).map_err(|err| Error::UrlParse(href.to_string(), err))?;
         Ok(Some(url))
     }
 
     /// Parse a [`PypiFile`] from an `<a>` tag.
     ///
     /// Returns `None` if the `<a>` doesn't have an `href` attribute.
-    fn parse_anchor(link: &HTMLTag) -> Result<Option<PypiFile>, Error> {
+    fn parse_anchor(
+        link: &Element<'_, '_>,
+        interner: &mut RequiresPythonInterner,
+    ) -> Result<Option<PypiFile>, Error> {
         // Extract the href.
         let Some(href) = attribute(link, "href").filter(|href| !href.is_empty()) else {
             return Ok(None);
         };
 
         // Extract the hash, which should be in the fragment.
-        let decoded = html_escape::decode_html_entities(&href);
-        let (path, hashes) = if let Some((path, fragment)) = decoded.split_once('#') {
+        let (path, hashes) = if let Some((path, fragment)) = href.split_once('#') {
             let fragment = percent_encoding::percent_decode_str(fragment).decode_utf8()?;
             (
                 path,
@@ -214,11 +204,15 @@ impl SimpleDetailHTML {
                                 return Err(HashError::UnsupportedHashAlgorithm(fragment).into());
                             }
                         }
+                        Err(
+                            err @ (HashError::InvalidDigestLength { .. }
+                            | HashError::InvalidDigestCharacters(_)),
+                        ) => return Err(err.into()),
                     }
                 },
             )
         } else {
-            (decoded.as_ref(), Hashes::default())
+            (href, Hashes::default())
         };
 
         // Extract the filename from the body text, which MUST match that of
@@ -238,14 +232,8 @@ impl SimpleDetailHTML {
 
         // Extract the `requires-python` value, which should be set on the
         // `data-requires-python` attribute.
-        let requires_python = if let Some(requires_python) = attribute(link, "data-requires-python")
-        {
-            let requires_python = std::str::from_utf8(requires_python.as_bytes())?;
-            let requires_python = html_escape::decode_html_entities(requires_python);
-            Some(LenientVersionSpecifiers::from_str(&requires_python).map(VersionSpecifiers::from))
-        } else {
-            None
-        };
+        let requires_python = attribute(link, "data-requires-python")
+            .map(|requires_python| interner.parse(requires_python));
 
         // Extract the `core-metadata` field, which is either set on:
         // - `data-core-metadata`, per PEP 714.
@@ -253,9 +241,7 @@ impl SimpleDetailHTML {
         let core_metadata = if let Some(dist_info_metadata) = attribute(link, "data-core-metadata")
             .or_else(|| attribute(link, "data-dist-info-metadata"))
         {
-            let dist_info_metadata = std::str::from_utf8(dist_info_metadata.as_bytes())?;
-            let dist_info_metadata = html_escape::decode_html_entities(dist_info_metadata);
-            match dist_info_metadata.as_ref() {
+            match dist_info_metadata {
                 "true" => Some(CoreMetadata::Bool(true)),
                 "false" => Some(CoreMetadata::Bool(false)),
                 fragment => match Hashes::parse_fragment(fragment) {
@@ -272,10 +258,8 @@ impl SimpleDetailHTML {
 
         // Extract the `yanked` field, which should be set on the `data-yanked`
         // attribute.
-        let yanked = if has_attribute(link, "data-yanked") {
+        let yanked = if link.has_attribute("data-yanked") {
             if let Some(yanked) = attribute(link, "data-yanked") {
-                let yanked = std::str::from_utf8(yanked.as_bytes())?;
-                let yanked = html_escape::decode_html_entities(yanked);
                 Some(Box::new(Yanked::Reason(yanked.into())))
             } else {
                 Some(Box::new(Yanked::Bool(true)))
@@ -287,16 +271,13 @@ impl SimpleDetailHTML {
         // Extract the `size` field, which should be set on the `data-size` attribute. This isn't
         // included in PEP 700, which omits the HTML API, but we respect it anyway. Since this
         // field isn't standardized, we discard errors.
-        let size = attribute(link, "data-size")
-            .and_then(|size| html_escape::decode_html_entities(&size).parse().ok());
+        let size = attribute(link, "data-size").and_then(|size| size.parse().ok());
 
         // Extract the `upload-time` field, which should be set on the `data-upload-time` attribute. This isn't
         // included in PEP 700, which omits the HTML API, but we respect it anyway. Since this
         // field isn't standardized, we discard errors.
-        let upload_time = attribute(link, "data-upload-time").and_then(|upload_time| {
-            let upload_time = html_escape::decode_html_entities(&upload_time);
-            Timestamp::from_str(&upload_time).ok()
-        });
+        let upload_time = attribute(link, "data-upload-time")
+            .and_then(|upload_time| Timestamp::from_str(upload_time).ok());
 
         Ok(Some(PypiFile {
             core_metadata,
@@ -321,16 +302,13 @@ pub(crate) struct SimpleIndexHtml {
 impl SimpleIndexHtml {
     /// Parse the list of project names from the Simple API index HTML page.
     pub(crate) fn parse(text: &str) -> Result<Self, Error> {
-        let dom = tl::parse(text, tl::ParserOptions::default())?;
+        let dom = Document::parse(text)?;
 
         // Parse each `<a>` tag to extract the project name.
-        let parser = dom.parser();
         let mut projects = dom
-            .nodes()
-            .iter()
-            .filter_map(|node| node.as_tag())
-            .filter(|link| is_tag(link, b"a"))
-            .filter_map(|link| Self::parse_anchor_project_name(link, parser))
+            .elements()
+            .filter(|link| link.is("a"))
+            .filter_map(|link| Self::parse_anchor_project_name(&link))
             .collect::<Vec<_>>();
 
         // Sort for deterministic ordering.
@@ -342,12 +320,12 @@ impl SimpleIndexHtml {
     /// Parse a project name from an `<a>` tag.
     ///
     /// Returns `None` if the `<a>` doesn't have an `href` attribute or text content.
-    fn parse_anchor_project_name(link: &HTMLTag, parser: &tl::Parser) -> Option<PackageName> {
+    fn parse_anchor_project_name(link: &Element<'_, '_>) -> Option<PackageName> {
         // Extract the href.
         attribute(link, "href").filter(|href| !href.is_empty())?;
 
         // Extract the text content, which should be the project name.
-        let inner_text = link.inner_text(parser);
+        let inner_text = link.text();
         let project_name = inner_text.trim();
 
         if project_name.is_empty() {
@@ -367,10 +345,10 @@ pub enum Error {
     FromUtf8(#[from] std::string::FromUtf8Error),
 
     #[error("Failed to parse URL: {0}")]
-    UrlParse(String, #[source] DisplaySafeUrlError),
+    UrlParse(String, #[source] SafeUrlError),
 
     #[error(transparent)]
-    HtmlParse(#[from] tl::ParseError),
+    HtmlParse(#[from] astral_html::Error),
 
     #[error("Missing href attribute on anchor link: `{0}`")]
     MissingHref(String),
@@ -407,7 +385,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -416,7 +394,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -463,12 +441,12 @@ mod tests {
 <html>
 <body>
 <h1>Links for jinja2</h1>
-<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#md5=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#md5=6088930bfe239f0e6710546ab9c19c9e">Jinja2-3.1.2-py3-none-any.whl</a><br/>
 </body>
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -477,7 +455,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -499,7 +477,7 @@ mod tests {
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: Some(
-                            "6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
+                            "6088930bfe239f0e6710546ab9c19c9e",
                         ),
                         sha256: None,
                         sha384: None,
@@ -518,6 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn reject_invalid_hashes() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<a href="/whl/Jinja2-3.1.0-py3-none-any.whl#sha256=short">Jinja2-3.1.0-py3-none-any.whl</a>
+</body>
+</html>
+"#;
+        let base =
+            SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").expect("valid base URL");
+        let error = SimpleDetailHTML::parse(text, &base).expect_err("invalid digest length");
+        insta::assert_snapshot!(error, @"Invalid hash digest length (expected 64 hexadecimal characters, found 5)");
+    }
+
+    #[test]
     fn parse_base() {
         let text = r#"
 <!DOCTYPE html>
@@ -532,7 +526,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -541,7 +535,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -593,7 +587,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -602,7 +596,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -654,7 +648,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -663,7 +657,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -715,7 +709,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -724,7 +718,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -774,7 +768,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -783,7 +777,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -833,7 +827,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     ";
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -842,7 +836,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -875,7 +869,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -884,7 +878,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -917,7 +911,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -926,7 +920,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -976,7 +970,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -985,7 +979,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1035,7 +1029,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base);
         insta::assert_debug_snapshot!(result, @r#"
         Ok(
@@ -1045,7 +1039,7 @@ mod tests {
                     reason: None,
                 },
                 base: BaseUrl(
-                    DisplaySafeUrl {
+                    SafeUrl {
                         scheme: "https",
                         cannot_be_a_base: false,
                         username: "",
@@ -1096,7 +1090,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base);
         insta::assert_debug_snapshot!(result, @r#"
         Ok(
@@ -1106,7 +1100,7 @@ mod tests {
                     reason: None,
                 },
                 base: BaseUrl(
-                    DisplaySafeUrl {
+                    SafeUrl {
                         scheme: "https",
                         cannot_be_a_base: false,
                         username: "",
@@ -1157,7 +1151,7 @@ mod tests {
 </html>
 <!--TIMESTAMP 1703347410-->
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap_err();
         insta::assert_snapshot!(result, @"Unsupported hash algorithm (expected one of: `md5`, `sha256`, `sha384`, `sha512`, or `blake2b`) on: `blake2=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61`");
     }
@@ -1174,10 +1168,9 @@ mod tests {
         </body>
         </html>
     "#;
-        let base = DisplaySafeUrl::parse(
-            "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
-        )
-        .unwrap();
+        let base =
+            SafeUrl::parse("https://storage.googleapis.com/jax-releases/jax_cuda_releases.html")
+                .unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -1186,7 +1179,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1262,7 +1255,7 @@ mod tests {
         </body>
         </html>
     "#;
-        let base = DisplaySafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
+        let base = SafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
             .unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
@@ -1272,7 +1265,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1370,7 +1363,7 @@ mod tests {
 </body>
 </html>
     "#;
-        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let base = SafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
         SimpleDetailHTML {
@@ -1379,7 +1372,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1446,7 +1439,7 @@ mod tests {
 </body>
 </html>
     "#;
-        let base = DisplaySafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
+        let base = SafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
             .unwrap();
         let result = SimpleDetailHTML::parse(text, &base).unwrap();
         insta::assert_debug_snapshot!(result, @r#"
@@ -1456,7 +1449,7 @@ mod tests {
                 reason: None,
             },
             base: BaseUrl(
-                DisplaySafeUrl {
+                SafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1600,7 +1593,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/pepy/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/pepy/").unwrap(),
         )
         .unwrap();
         insta::assert_debug_snapshot!(result.project_status, @"
@@ -1634,7 +1627,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
         )
         .unwrap();
         insta::assert_debug_snapshot!(result.project_status, @r#"
@@ -1668,7 +1661,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
         )
         .unwrap();
         insta::assert_debug_snapshot!(
@@ -1800,7 +1793,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/fakeproject/").unwrap(),
         )
         .unwrap();
         insta::assert_debug_snapshot!(
@@ -1840,7 +1833,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/spookyproject/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/spookyproject/").unwrap(),
         );
         insta::assert_debug_snapshot!(result.unwrap().project_status, @r#"
         ProjectStatus {
@@ -1874,7 +1867,7 @@ mod tests {
 
         let result = SimpleDetailHTML::parse(
             text,
-            &DisplaySafeUrl::parse("https://pypi.org/simple/unknownproject/").unwrap(),
+            &SafeUrl::parse("https://pypi.org/simple/unknownproject/").unwrap(),
         );
         insta::assert_debug_snapshot!(result.unwrap().project_status, @"
         ProjectStatus {
@@ -2057,6 +2050,120 @@ mod tests {
                 ),
             ],
         }
+        "#);
+    }
+
+    /// Attribute values are decoded once, including nested character references.
+    #[test]
+    fn parse_html_entities_once() {
+        let text = r#"
+<a href="/files/example.whl?key=&amp;amp;" data-yanked="&amp;lt;">example.whl</a>
+        "#;
+        let result = SimpleDetailHTML::parse(
+            text,
+            &SafeUrl::parse("https://example.com/simple/example/").unwrap(),
+        )
+        .unwrap();
+        let file = &result.files[0];
+        insta::assert_debug_snapshot!(
+            (&file.url, file.yanked.as_deref()), @r#"
+        (
+            "/files/example.whl?key=&amp;",
+            Some(
+                Reason(
+                    "&lt;",
+                ),
+            ),
+        )
+        "#);
+    }
+
+    /// A boolean yanked attribute differs from an explicitly empty reason.
+    #[test]
+    fn parse_boolean_and_empty_attributes() {
+        let text = r#"
+<a href="/files/absent.whl">absent.whl</a>
+<a href="/files/boolean.whl" data-yanked>boolean.whl</a>
+<a href="/files/empty.whl" data-yanked="">empty.whl</a>
+<a href data-yanked>no href value</a>
+<a href="" data-yanked>empty href value</a>
+        "#;
+        let result = SimpleDetailHTML::parse(
+            text,
+            &SafeUrl::parse("https://example.com/simple/example/").unwrap(),
+        )
+        .unwrap();
+        insta::assert_debug_snapshot!(
+            result.files.iter().map(|file| (&file.filename, file.yanked.as_deref())).collect::<Vec<_>>(), @r#"
+        [
+            (
+                "absent.whl",
+                None,
+            ),
+            (
+                "boolean.whl",
+                Some(
+                    Bool(
+                        true,
+                    ),
+                ),
+            ),
+            (
+                "empty.whl",
+                Some(
+                    Reason(
+                        "",
+                    ),
+                ),
+            ),
+        ]
+        "#);
+    }
+
+    /// Markup inside HTML text elements cannot add package or file links.
+    #[test]
+    fn parse_ignores_links_in_text_elements() {
+        let text = r#"
+<script>const link = '<a href="/files/script.whl">script</a>';</script>
+<style><a href="/files/style.whl">style</a></style>
+<textarea><a href="/files/textarea.whl">textarea</a></textarea>
+<title><a href="/files/title.whl">title</a></title>
+<a href="/files/real.whl">real</a>
+        "#;
+        let detail = SimpleDetailHTML::parse(
+            text,
+            &SafeUrl::parse("https://example.com/simple/example/").unwrap(),
+        )
+        .unwrap();
+        let index = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(
+            (detail.files.iter().map(|file| &file.filename).collect::<Vec<_>>(), index.projects), @r#"
+        (
+            [
+                "real.whl",
+            ],
+            [
+                PackageName(
+                    "real",
+                ),
+            ],
+        )
+        "#);
+    }
+
+    /// Project names combine descendant text and decoded character references.
+    #[test]
+    fn parse_simple_index_nested_text_and_entities() {
+        let result = SimpleIndexHtml::parse(
+            r#"<a href="/simple/pyyaml/"> Py<!--ignored--><span>Y&#65;</span>ML </a>"#,
+        )
+        .unwrap();
+        insta::assert_debug_snapshot!(result.projects, @r#"
+        [
+            PackageName(
+                "pyyaml",
+            ),
+        ]
         "#);
     }
 }

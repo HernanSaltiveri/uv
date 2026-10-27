@@ -29,7 +29,7 @@ The temporary directory is used for ephemeral data.
 
 ### Cache directory
 
-The cache directory is used for data that is disposable, but is useful to be long-lived.
+The cache directory is used for disposable data that is useful to keep between invocations.
 
 === "Unix"
 
@@ -193,6 +193,12 @@ i.e., next to the `pyproject.toml`.
 Use the `UV_PROJECT_ENVIRONMENT` environment variable to override this location. For more details,
 see the
 [projects environment documentation](../concepts/projects/config.md#project-environment-path).
+
+With the [`centralized-project-envs` preview feature](../concepts/preview.md), uv stores default
+project environments in the [cache directory](#cache-directory). They can be removed by
+`uv cache clean` or `uv cache prune` and are recreated when next needed. See the
+[centralized project environments](../concepts/projects/layout.md#centralized-project-environments)
+documentation for details.
 
 ### Script virtual environments
 

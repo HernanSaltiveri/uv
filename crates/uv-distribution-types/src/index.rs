@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use http::HeaderValue;
+use http::{HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
-use url::Url;
 
 use uv_auth::{AuthPolicy, Credentials, CredentialsFromUrlError};
-use uv_redacted::DisplaySafeUrl;
+use uv_pypi_types::HashAlgorithm;
+use uv_redacted::SafeUrl;
+use uv_redacted::policy::Stripped;
 use uv_small_str::SmallString;
 
 use crate::exclude_newer::ExcludeNewerOverride;
@@ -29,12 +30,12 @@ pub struct IndexCacheControl {
 
 impl IndexCacheControl {
     /// Return the default Simple API cache control headers for the given index URL, if applicable.
-    fn simple_api_cache_control(_url: &Url) -> Option<HeaderValue> {
+    fn simple_api_cache_control(_url: &SafeUrl) -> Option<HeaderValue> {
         None
     }
 
     /// Return the default files cache control headers for the given index URL, if applicable.
-    fn artifact_cache_control(url: &Url) -> Option<HeaderValue> {
+    fn artifact_cache_control(url: &SafeUrl) -> Option<HeaderValue> {
         let dominated_by_pytorch_or_nvidia = url.host_str().is_some_and(|host| {
             host.eq_ignore_ascii_case("download.pytorch.org")
                 || host.eq_ignore_ascii_case("pypi.nvidia.com")
@@ -195,7 +196,7 @@ pub struct Index {
     /// url = "https://pypi.org/simple"
     /// publish-url = "https://upload.pypi.org/legacy/"
     /// ```
-    pub publish_url: Option<DisplaySafeUrl>,
+    pub publish_url: Option<SafeUrl<Stripped>>,
     /// When uv should use authentication for requests to the index.
     ///
     /// ```toml
@@ -206,8 +207,8 @@ pub struct Index {
     /// ```
     #[serde(default)]
     pub authenticate: AuthPolicy,
-    /// Status codes that uv should ignore when deciding whether
-    /// to continue searching in the next index after a failure.
+    /// Status codes that uv should ignore when deciding whether to continue resolution after a
+    /// request to this index fails.
     ///
     /// ```toml
     /// [[tool.uv.index]]
@@ -230,6 +231,21 @@ pub struct Index {
     /// ```
     #[serde(default)]
     pub cache_control: Option<IndexCacheControl>,
+    /// The hash algorithm that must be used for distributions resolved from this index.
+    ///
+    /// If a distribution does not advertise a hash using this algorithm, lockfile generation
+    /// will fail.
+    ///
+    /// This option is in preview and may change in any future release.
+    ///
+    /// ```toml
+    /// [[tool.uv.index]]
+    /// name = "my-index"
+    /// url = "https://<omitted>/simple"
+    /// hash-algorithm = "sha256"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_algorithm: Option<IndexHashAlgorithm>,
     /// An index-specific `exclude-newer` cutoff.
     ///
     /// Accepts the same date, timestamp, and duration values as the global `exclude-newer`
@@ -258,7 +274,7 @@ pub struct Index {
 #[derive(Debug, Error)]
 #[error("Failed to parse credentials in index URL: {url}")]
 pub struct IndexCredentialsError {
-    url: DisplaySafeUrl,
+    url: SafeUrl,
     #[source]
     source: CredentialsFromUrlError,
 }
@@ -276,6 +292,7 @@ impl PartialEq for Index {
             authenticate,
             ignore_error_codes,
             cache_control,
+            hash_algorithm,
             exclude_newer,
         } = self;
         *url == other.url
@@ -287,6 +304,7 @@ impl PartialEq for Index {
             && *authenticate == other.authenticate
             && *ignore_error_codes == other.ignore_error_codes
             && *cache_control == other.cache_control
+            && *hash_algorithm == other.hash_algorithm
             && *exclude_newer == other.exclude_newer
     }
 }
@@ -312,6 +330,7 @@ impl Ord for Index {
             authenticate,
             ignore_error_codes,
             cache_control,
+            hash_algorithm,
             exclude_newer,
         } = self;
         url.cmp(&other.url)
@@ -323,6 +342,7 @@ impl Ord for Index {
             .then_with(|| authenticate.cmp(&other.authenticate))
             .then_with(|| ignore_error_codes.cmp(&other.ignore_error_codes))
             .then_with(|| cache_control.cmp(&other.cache_control))
+            .then_with(|| hash_algorithm.cmp(&other.hash_algorithm))
             .then_with(|| exclude_newer.cmp(&other.exclude_newer))
     }
 }
@@ -340,6 +360,7 @@ impl std::hash::Hash for Index {
             authenticate,
             ignore_error_codes,
             cache_control,
+            hash_algorithm,
             exclude_newer,
         } = self;
         url.hash(state);
@@ -351,6 +372,7 @@ impl std::hash::Hash for Index {
         authenticate.hash(state);
         ignore_error_codes.hash(state);
         cache_control.hash(state);
+        hash_algorithm.hash(state);
         exclude_newer.hash(state);
     }
 }
@@ -378,6 +400,32 @@ pub enum IndexFormat {
     Flat,
 }
 
+/// A hash algorithm that can be required for distributions resolved from an index.
+#[derive(
+    Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum IndexHashAlgorithm {
+    Md5,
+    Sha256,
+    Sha384,
+    Sha512,
+    Blake2b,
+}
+
+impl From<IndexHashAlgorithm> for HashAlgorithm {
+    fn from(value: IndexHashAlgorithm) -> Self {
+        match value {
+            IndexHashAlgorithm::Md5 => Self::Md5,
+            IndexHashAlgorithm::Sha256 => Self::Sha256,
+            IndexHashAlgorithm::Sha384 => Self::Sha384,
+            IndexHashAlgorithm::Sha512 => Self::Sha512,
+            IndexHashAlgorithm::Blake2b => Self::Blake2b256,
+        }
+    }
+}
+
 impl Index {
     /// Initialize an [`Index`] from a pip-style `--index-url`.
     pub fn from_index_url(url: IndexUrl) -> Self {
@@ -392,6 +440,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            hash_algorithm: None,
             exclude_newer: None,
         }
     }
@@ -409,6 +458,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            hash_algorithm: None,
             exclude_newer: None,
         }
     }
@@ -426,6 +476,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            hash_algorithm: None,
             exclude_newer: None,
         }
     }
@@ -442,16 +493,16 @@ impl Index {
         &self.url
     }
 
-    /// Return the raw [`Url`] of the index.
-    pub fn raw_url(&self) -> &DisplaySafeUrl {
+    /// Return the underlying [`SafeUrl`] of the index.
+    pub fn raw_url(&self) -> &SafeUrl {
         self.url.url()
     }
 
-    /// Return the root [`Url`] of the index, if applicable.
+    /// Return the root [`SafeUrl`] of the index, if applicable.
     ///
     /// For indexes with a `/simple` endpoint, this is simply the URL with the final segment
     /// removed. This is useful, e.g., for credential propagation to other endpoints on the index.
-    pub fn root_url(&self) -> Option<DisplaySafeUrl> {
+    pub fn root_url(&self) -> Option<SafeUrl> {
         self.url.root()
     }
 
@@ -503,10 +554,10 @@ impl Index {
 
     /// Resolve the index relative to the given root directory.
     pub fn relative_to(mut self, root_dir: &Path) -> Result<Self, IndexUrlError> {
-        if let IndexUrl::Path(ref url) = self.url {
-            if let Some(given) = url.given() {
-                self.url = IndexUrl::parse(given, Some(root_dir))?;
-            }
+        if let IndexUrl::Path(ref url) = self.url
+            && let Some(given) = url.given()
+        {
+            self.url = IndexUrl::parse(given, Some(root_dir))?;
         }
         Ok(self)
     }
@@ -518,6 +569,15 @@ impl Index {
         } else {
             IndexStatusCodeStrategy::from_index_url(self.url.url())
         }
+    }
+
+    /// Return whether the given status code is explicitly ignored for this index.
+    pub(crate) fn ignores_error_code(&self, status_code: StatusCode) -> bool {
+        self.ignore_error_codes.as_ref().is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|ignored_status_code| **ignored_status_code == status_code)
+        })
     }
 
     /// Return the cache control header for file requests to this index, if any.
@@ -555,6 +615,7 @@ impl From<IndexUrl> for Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            hash_algorithm: None,
             exclude_newer: None,
         }
     }
@@ -565,24 +626,25 @@ impl FromStr for Index {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Determine whether the source is prefixed with a name, as in `name=https://pypi.org/simple`.
-        if let Some((name, url)) = s.split_once('=') {
-            if !name.chars().any(|c| c == ':') {
-                let name = IndexName::from_str(name)?;
-                let url = IndexUrl::from_str(url)?;
-                return Ok(Self {
-                    name: Some(name),
-                    url,
-                    explicit: false,
-                    default: false,
-                    origin: None,
-                    format: IndexFormat::Simple,
-                    publish_url: None,
-                    authenticate: AuthPolicy::default(),
-                    ignore_error_codes: None,
-                    cache_control: None,
-                    exclude_newer: None,
-                });
-            }
+        if let Some((name, url)) = s.split_once('=')
+            && !name.chars().any(|c| c == ':')
+        {
+            let name = IndexName::from_str(name)?;
+            let url = IndexUrl::from_str(url)?;
+            return Ok(Self {
+                name: Some(name),
+                url,
+                explicit: false,
+                default: false,
+                origin: None,
+                format: IndexFormat::Simple,
+                publish_url: None,
+                authenticate: AuthPolicy::default(),
+                ignore_error_codes: None,
+                cache_control: None,
+                hash_algorithm: None,
+                exclude_newer: None,
+            });
         }
 
         // Otherwise, assume the source is a URL.
@@ -598,6 +660,7 @@ impl FromStr for Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            hash_algorithm: None,
             exclude_newer: None,
         })
     }
@@ -683,13 +746,15 @@ struct IndexWire {
     default: bool,
     #[serde(default)]
     format: IndexFormat,
-    publish_url: Option<DisplaySafeUrl>,
+    publish_url: Option<SafeUrl>,
     #[serde(default)]
     authenticate: AuthPolicy,
     #[serde(default)]
     ignore_error_codes: Option<Vec<SerializableStatusCode>>,
     #[serde(default)]
     cache_control: Option<IndexCacheControl>,
+    #[serde(default)]
+    hash_algorithm: Option<IndexHashAlgorithm>,
     #[serde(default)]
     exclude_newer: Option<ExcludeNewerOverride>,
 }
@@ -715,10 +780,11 @@ impl<'de> Deserialize<'de> for Index {
             default: wire.default,
             origin: None,
             format: wire.format,
-            publish_url: wire.publish_url,
+            publish_url: wire.publish_url.map(|url| url.with_policy(Stripped)),
             authenticate: wire.authenticate,
             ignore_error_codes: wire.ignore_error_codes,
             cache_control: wire.cache_control,
+            hash_algorithm: wire.hash_algorithm,
             exclude_newer: wire.exclude_newer,
         })
     }
@@ -737,6 +803,8 @@ pub enum IndexSourceError {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use http::HeaderValue;
 
@@ -852,9 +920,6 @@ mod tests {
 
         let index: Index = toml::from_str(toml_str).unwrap();
         assert_eq!(index.name.as_ref().unwrap().as_ref(), "internal");
-        assert!(matches!(
-            index.exclude_newer,
-            Some(ExcludeNewerOverride::Enabled(_))
-        ));
+        assert_matches!(index.exclude_newer, Some(ExcludeNewerOverride::Enabled(_)));
     }
 }

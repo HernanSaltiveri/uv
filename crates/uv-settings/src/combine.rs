@@ -1,29 +1,24 @@
 use std::path::PathBuf;
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
-use url::Url;
-
 use uv_configuration::{
-    BuildIsolation, ExportFormat, IndexStrategy, KeyringProviderType, NoSources, ProxyUrl,
-    Reinstall, RequiredVersion, TargetTriple, TrustedPublishing, Upgrade,
+    AddBoundsKind, AnnotationStyle, BuildIsolation, ExcludeNewer, ExcludeNewerPackage,
+    ExportFormat, ForkStrategy, IndexStrategy, KeyringProviderType, NoSources, PrereleaseMode,
+    PrereleasePackage, ProxyUrl, Reinstall, RequiredVersion, ResolutionMode, TargetTriple,
+    TrustedPublishing, Upgrade,
 };
 use uv_distribution_types::{
-    ConfigSettings, ExtraBuildVariables, Index, IndexUrl, PackageConfigSettings, PipExtraIndex,
-    PipFindLinks, PipIndex,
+    ConfigSettings, ExcludeNewerOverride, ExcludeNewerValue, ExtraBuildVariables, Index, IndexUrl,
+    MinimumLibcVersion, PackageConfigSettings, PipExtraIndex, PipFindLinks, PipIndex,
 };
 use uv_install_wheel::LinkMode;
 use uv_pypi_types::{SchemaConflicts, SupportedEnvironments};
-use uv_python::{PythonDownloads, PythonPreference, PythonVersion};
-use uv_redacted::DisplaySafeUrl;
-use uv_resolver::{
-    AnnotationStyle, ExcludeNewer, ExcludeNewerPackage, ExcludeNewerValue, ForkStrategy,
-    PrereleaseMode, ResolutionMode,
-};
+use uv_python_types::{PythonDownloads, PythonPreference, PythonVersion};
+use uv_redacted::SafeUrl;
 use uv_torch::TorchMode;
 use uv_workspace::pyproject::ExtraBuildDependencies;
-use uv_workspace::pyproject_mut::AddBoundsKind;
 
-use crate::{AuditOptions, FilesystemOptions, Options, PipOptions};
+use crate::{AuditOptions, FilesystemOptions, Options, PipOptions, PreviewOption};
 
 pub trait Combine {
     /// Combine two values, preferring the values in `self`.
@@ -94,21 +89,24 @@ macro_rules! impl_combine_or {
 impl_combine_or!(AddBoundsKind);
 impl_combine_or!(AnnotationStyle);
 impl_combine_or!(ExcludeNewer);
+impl_combine_or!(ExcludeNewerOverride);
 impl_combine_or!(ExcludeNewerValue);
 impl_combine_or!(ExportFormat);
 impl_combine_or!(ForkStrategy);
+impl_combine_or!(MinimumLibcVersion);
 impl_combine_or!(Index);
 impl_combine_or!(IndexStrategy);
 impl_combine_or!(IndexUrl);
 impl_combine_or!(KeyringProviderType);
 impl_combine_or!(LinkMode);
-impl_combine_or!(DisplaySafeUrl);
+impl_combine_or!(SafeUrl);
 impl_combine_or!(NonZeroUsize);
 impl_combine_or!(PathBuf);
 impl_combine_or!(PipExtraIndex);
 impl_combine_or!(PipFindLinks);
 impl_combine_or!(PipIndex);
 impl_combine_or!(PrereleaseMode);
+impl_combine_or!(PreviewOption);
 impl_combine_or!(ProxyUrl);
 impl_combine_or!(PythonDownloads);
 impl_combine_or!(PythonPreference);
@@ -121,7 +119,6 @@ impl_combine_or!(SupportedEnvironments);
 impl_combine_or!(TargetTriple);
 impl_combine_or!(TorchMode);
 impl_combine_or!(TrustedPublishing);
-impl_combine_or!(Url);
 impl_combine_or!(bool);
 
 impl<T> Combine for Option<Vec<T>> {
@@ -165,6 +162,21 @@ impl Combine for Option<ExcludeNewerPackage> {
                 Some(a)
             }
             (a, b) => a.or(b),
+        }
+    }
+}
+
+impl Combine for Option<PrereleasePackage> {
+    /// Merge package-specific policies, retaining the higher-precedence value for duplicates.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Some(mut current), Some(fallback)) => {
+                for (package, mode) in fallback {
+                    current.entry(package).or_insert(mode);
+                }
+                Some(current)
+            }
+            (current, fallback) => current.or(fallback),
         }
     }
 }
